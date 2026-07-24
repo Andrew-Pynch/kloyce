@@ -1,0 +1,29 @@
+# Maintainer: Andrew Pynch <andrew@pynch.dev>
+pkgname=kloyce-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Push-to-talk speech-to-text daemon for Wayland (Hyprland)"
+arch=('x86_64')
+url="https://github.com/andrew-pynch/kloyce"
+license=('MIT')
+depends=('pipewire' 'wl-clipboard' 'wtype' 'libnotify' 'ffmpeg')
+optdepends=(
+    'tmux: direct pane injection of transcriptions'
+    'hyprland: window context tracking and keybinding'
+)
+provides=('kloyce' 'kloyce-ctl')
+conflicts=('kloyce' 'kloyce-git')
+source=(
+    "${url}/releases/download/v${pkgver}/kloyce-x86_64-unknown-linux-gnu.tar.xz"
+    "${url}/releases/download/v${pkgver}/kloyce-ctl-x86_64-unknown-linux-gnu.tar.xz"
+)
+sha256sums=(
+    '6e78ca37ed81bbc6a757bb2d580ca4c31c1471c265df534b3803ee092d4d0e18'
+    '15c26ab107fda47fd47d19b53f2ff6c2289e6ef1ec679bf4a8811abeab9f0f98'
+)
+
+package() {
+    install -Dm755 "kloyce-x86_64-unknown-linux-gnu/kloyce" "${pkgdir}/usr/bin/kloyce"
+    install -Dm755 "kloyce-ctl-x86_64-unknown-linux-gnu/kloyce-ctl" "${pkgdir}/usr/bin/kloyce-ctl"
+    install -Dm644 "kloyce-x86_64-unknown-linux-gnu/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

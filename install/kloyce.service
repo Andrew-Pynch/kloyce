@@ -1,0 +1,12 @@
+[Unit]
+Description=Kloyce Speech-to-Text Daemon
+After=graphical-session.target pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/kloyce daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,90 @@
+name: Release macOS
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tauri-cli
+        run: cargo install tauri-cli
+      - name: Build + sign app
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: cargo tauri build --target aarch64-apple-darwin
+      - name: Verify signature
+        run: codesign -dvv target/aarch64-apple-darwin/release/bundle/macos/Kloyce.app
+      - name: Notarize app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          DMG=$(ls target/aarch64-apple-darwin/release/bundle/dmg/*.dmg)
+          APP="target/aarch64-apple-darwin/release/bundle/macos/Kloyce.app"
+
+          xcrun notarytool submit "$DMG" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 1800
+
+          xcrun stapler staple "$DMG"
+          xcrun stapler staple "$APP"
+      - name: Verify notarization
+        run: |
+          xcrun stapler validate target/aarch64-apple-darwin/release/bundle/macos/Kloyce.app
+          xcrun stapler validate target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          spctl -a -vvv target/aarch64-apple-darwin/release/bundle/macos/Kloyce.app
+      - name: Generate update manifest
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          SIG=$(cat target/aarch64-apple-darwin/release/bundle/macos/Kloyce.app.tar.gz.sig)
+          cat > latest.json <<EOF
+          {
+            "version": "$VERSION",
+            "notes": "Kloyce $TAG",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "$SIG",
+                "url": "https://github.com/andrew-pynch/kloyce/releases/download/$TAG/Kloyce.app.tar.gz"
+              }
+            }
+          }
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kloyce-macOS-aarch64
+          path: |
+            target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            target/aarch64-apple-darwin/release/bundle/macos/Kloyce.app.tar.gz
+            target/aarch64-apple-darwin/release/bundle/macos/Kloyce.app.tar.gz.sig
+            latest.json
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          DMG=$(ls target/aarch64-apple-darwin/release/bundle/dmg/*.dmg)
+          UPDATER_TAR="target/aarch64-apple-darwin/release/bundle/macos/Kloyce.app.tar.gz"
+          UPDATER_SIG="target/aarch64-apple-darwin/release/bundle/macos/Kloyce.app.tar.gz.sig"
+          gh release upload "$TAG" "$DMG" "$UPDATER_TAR" "$UPDATER_SIG" latest.json --clobber 2>/dev/null \
+            || gh release create "$TAG" "$DMG" "$UPDATER_TAR" "$UPDATER_SIG" latest.json --title "Kloyce $TAG" --generate-notes

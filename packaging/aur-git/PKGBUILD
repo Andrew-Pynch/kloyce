@@ -1,0 +1,35 @@
+# Maintainer: Andrew Pynch <andrew@pynch.dev>
+pkgname=kloyce-git
+pkgver=r0.PLACEHOLDER
+pkgrel=1
+pkgdesc="Push-to-talk speech-to-text daemon for Wayland (Hyprland)"
+arch=('x86_64')
+url="https://github.com/andrew-pynch/kloyce"
+license=('MIT')
+depends=('pipewire' 'wl-clipboard' 'wtype' 'libnotify' 'ffmpeg')
+makedepends=('cargo' 'git')
+optdepends=(
+    'tmux: direct pane injection of transcriptions'
+    'hyprland: window context tracking and keybinding'
+)
+provides=('kloyce' 'kloyce-ctl')
+conflicts=('kloyce' 'kloyce-bin')
+source=("git+${url}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd kloyce
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+    cd kloyce
+    cargo build --release --workspace
+}
+
+package() {
+    cd kloyce
+    install -Dm755 "target/release/kloyce" "${pkgdir}/usr/bin/kloyce"
+    install -Dm755 "target/release/kloyce-ctl" "${pkgdir}/usr/bin/kloyce-ctl"
+    install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

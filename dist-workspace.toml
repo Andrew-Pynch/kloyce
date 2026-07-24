@@ -1,0 +1,9 @@
+[workspace]
+members = ["cargo:kloyce", "cargo:kloyce-ctl"]
+
+[dist]
+cargo-dist-version = "0.31.0"
+ci = "github"
+installers = ["shell"]
+targets = ["x86_64-unknown-linux-gnu"]
+install-path = "CARGO_HOME"

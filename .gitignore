@@ -1,0 +1,54 @@
+# dependencies / build
+node_modules/
+**/.next/
+**/.next/**
+**/target/
+**/zig-out/
+**/.zig-cache/
+*.tsbuildinfo
+dist/
+build/
+out/
+coverage/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
+*.p12
+*credentials*
+secrets/
+keys/
+
+# models / media / heavy binaries
+models/
+**/models/
+*.wav
+*.bin
+*.zip
+*.mp3
+*.gguf
+*.onnx
+
+# local databases / dumps
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.db
+*.db-*
+*.wal
+*.shm
+*.dump
+*.sql.gz
+
+# python / os / editor / local
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+.direnv/
+.vercel/
+.scratch/

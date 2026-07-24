@@ -1,0 +1,999 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kloyce Dashboard</title>
+<style>
+:root {
+  --bg:#0a0a0a; --surface:#141414; --surface-2:#191919; --border:#262626;
+  --text:#e5e5e5; --muted:#737373; --accent:#3b82f6; --green:#22c55e;
+  --red:#ef4444; --yellow:#eab308; --accent-dim:rgba(59,130,246,0.15);
+  --glow-red:rgba(239,68,68,0.3); --glow-yellow:rgba(234,179,8,0.3);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'SF Mono','Cascadia Code','Fira Code',monospace;background:var(--bg);color:var(--text);padding:1.5rem;max-width:960px;margin:0 auto}
+button,input,select{font:inherit}
+button,select,input{border-radius:6px;border:1px solid var(--border);background:var(--surface-2);color:var(--text)}
+button{cursor:pointer;padding:.48rem .7rem}
+button:hover:not(:disabled){border-color:var(--accent);background:var(--accent-dim)}
+button:disabled,select:disabled,input:disabled{opacity:.55;cursor:not-allowed}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;gap:1rem}
+.header h1{font-size:1.25rem;font-weight:600}
+.header h1 span{color:var(--muted);font-weight:400}
+.header-actions{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.gpu-badge{font-size:.7rem;color:var(--muted);background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:.25rem .6rem;display:none}
+.status-bar{display:flex;gap:1.5rem;align-items:center;flex-wrap:wrap;padding:1rem 1.25rem;background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:1.5rem}
+.status-indicator{display:flex;align-items:center;gap:.5rem}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--green);transition:background .2s}
+.dot.recording{background:var(--red);animation:pulse 1s infinite}
+.dot.transcribing{background:var(--yellow);animation:pulse .5s infinite}
+.dot.pop{animation:pop .2s ease-out}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes pop{0%{transform:scale(1)}50%{transform:scale(1.4)}100%{transform:scale(1)}}
+.stat{color:var(--muted);font-size:.85rem}
+.stat strong{color:var(--text)}
+.activity{max-height:0;overflow:hidden;transition:max-height .4s ease,margin .4s ease;margin-bottom:0}
+.activity.active{max-height:200px;margin-bottom:1.5rem}
+.activity-inner,.panel,.job-card,.log-entry{background:var(--surface);border:1px solid var(--border);border-radius:8px}
+.activity-inner{padding:1rem 1.25rem}
+.activity.recording .activity-inner{box-shadow:0 0 15px var(--glow-red);border-color:var(--red)}
+.activity.transcribing .activity-inner{box-shadow:0 0 15px var(--glow-yellow);border-color:var(--yellow)}
+.activity-label{font-size:.85rem;margin-bottom:.75rem}
+.waveform{display:flex;align-items:center;gap:4px;height:40px}
+.waveform .bar{width:3px;background:var(--red);border-radius:2px;animation:wave .8s ease-in-out infinite}
+@keyframes wave{0%,100%{height:20%}50%{height:80%}}
+.progress-outer{width:100%;height:8px;background:var(--border);border-radius:4px;overflow:hidden}
+.progress-inner{height:100%;width:0%;background:linear-gradient(90deg,var(--accent),#8b5cf6);border-radius:4px;transition:width .3s ease}
+.section{margin-bottom:1.5rem}
+.section-header{font-size:.85rem;color:var(--muted);margin-bottom:.75rem;text-transform:uppercase;letter-spacing:.05em}
+.panel{padding:1rem}
+.upload-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,.8fr);gap:1rem;align-items:start}
+.drop-zone{min-height:142px;border:1px dashed #3f3f46;border-radius:8px;background:#101010;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:.45rem;padding:1rem;transition:border-color .15s,background .15s}
+.drop-zone.dragging{border-color:var(--accent);background:var(--accent-dim)}
+.drop-zone strong{font-size:.95rem}
+.drop-zone span,.hint,.field-help,.job-meta,.log-meta{color:var(--muted);font-size:.75rem}
+.file-input{display:none}
+.settings-form{display:flex;flex-direction:column;gap:.75rem}
+.settings-form.hidden{display:none}
+.field{display:flex;flex-direction:column;gap:.35rem;min-width:0}
+.field label{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.field select,.field input{height:36px;padding:0 .55rem;min-width:0;width:100%}
+.field-row{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}
+.upload-actions{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+.primary{background:var(--accent);border-color:var(--accent);color:white}
+.danger:hover:not(:disabled){border-color:var(--red);background:rgba(239,68,68,.12)}
+.notice{min-height:1rem;color:var(--muted);font-size:.78rem;line-height:1.35}
+.notice.error{color:#fca5a5}
+.notice.ok{color:#86efac}
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:20;display:flex;align-items:flex-start;justify-content:center;padding:4vh 1rem;overflow:auto}
+.modal-backdrop.hidden{display:none}
+.modal{width:min(760px,100%);background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:0 20px 80px rgba(0,0,0,.55)}
+.modal-head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;padding:1rem 1.1rem;border-bottom:1px solid var(--border)}
+.modal-head h2{font-size:1rem;font-weight:600}
+.modal-body{padding:1rem 1.1rem;display:flex;flex-direction:column;gap:1rem}
+.modal-actions{display:flex;gap:.5rem;justify-content:flex-end;align-items:center;flex-wrap:wrap;padding:0 1.1rem 1rem}
+.settings-status-list,.model-list{display:flex;flex-direction:column;gap:.5rem}
+.settings-status,.model-row{border:1px solid var(--border);border-radius:6px;background:#101010;padding:.65rem .7rem}
+.settings-status{display:flex;justify-content:space-between;gap:.75rem;align-items:flex-start}
+.settings-status strong,.model-name strong{font-size:.82rem}
+.settings-status span,.model-path{display:block;color:var(--muted);font-size:.72rem;line-height:1.35;margin-top:.2rem;overflow-wrap:anywhere}
+.model-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:.75rem;align-items:center}
+.model-meta{display:flex;gap:.45rem;align-items:center;flex-wrap:wrap;margin-top:.3rem}
+.model-status{font-size:.68rem;text-transform:uppercase;letter-spacing:.04em;border:1px solid var(--border);border-radius:999px;padding:.16rem .42rem;color:var(--muted)}
+.model-status.installed{color:#86efac;border-color:rgba(34,197,94,.45)}
+.model-status.downloading{color:#bfdbfe;border-color:rgba(59,130,246,.45)}
+.model-status.error,.model-status.uninstalled{color:#fca5a5;border-color:rgba(239,68,68,.35)}
+.jobs{display:flex;flex-direction:column;gap:.6rem}
+.job-card{padding:.85rem 1rem}
+.job-head{display:flex;justify-content:space-between;gap:.75rem;align-items:flex-start;margin-bottom:.6rem}
+.job-title{min-width:0}
+.job-title strong{display:block;overflow-wrap:anywhere;font-size:.92rem}
+.job-meta{display:flex;gap:.75rem;flex-wrap:wrap;margin-top:.25rem}
+.status-pill{font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;color:var(--text);border:1px solid var(--border);border-radius:999px;padding:.22rem .48rem;white-space:nowrap}
+.status-queued{color:#bfdbfe;border-color:rgba(59,130,246,.45)}
+.status-succeeded{color:#86efac;border-color:rgba(34,197,94,.45)}
+.status-failed{color:#fca5a5;border-color:rgba(239,68,68,.45)}
+.status-cancelled{color:#d4d4d8;border-color:#52525b}
+.job-actions{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.job-result,.job-error{margin-top:.7rem;padding:.65rem;border-radius:6px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.84rem;line-height:1.45}
+.job-result{background:#0f172a;border:1px solid rgba(59,130,246,.25)}
+.job-error{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.28);color:#fca5a5}
+.gpu-section{margin-bottom:1.5rem}
+.gpu-unavailable{color:var(--muted);font-style:italic;padding:1.5rem;text-align:center;background:var(--surface);border:1px solid var(--border);border-radius:8px}
+.gpu-content{display:none}
+.sparkline-wrap{position:relative;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.75rem;margin-bottom:.75rem}
+.sparkline-wrap canvas{display:block;width:100%;height:120px}
+.sparkline-label{position:absolute;top:.75rem;right:.75rem;font-size:.8rem;color:var(--accent);font-weight:600}
+.vram-bar{position:relative;width:100%;height:24px;background:var(--border);border-radius:6px;overflow:hidden;margin-bottom:.75rem}
+.vram-fill{height:100%;width:0%;background:linear-gradient(90deg,#3b82f6,#8b5cf6);border-radius:6px;transition:width .5s ease}
+.vram-label{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:.75rem;color:var(--text);font-weight:500}
+.gauges{display:flex;gap:.75rem;justify-content:center}
+.gauge{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:.5rem;flex:1;max-width:140px;text-align:center}
+.gauge svg{width:100px;height:100px;display:block;margin:0 auto}
+.gauge-arc{stroke-dasharray:220;stroke-dashoffset:220;transition:stroke-dashoffset .5s ease,stroke .5s ease}
+.tabs{display:flex;gap:.5rem;align-items:center;margin-bottom:1rem;border-bottom:1px solid var(--border);overflow-x:auto}
+.tab-button{display:flex;align-items:center;gap:.5rem;border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;color:var(--muted);padding:.65rem .4rem .7rem;white-space:nowrap}
+.tab-button:hover:not(:disabled){background:transparent;color:var(--text);border-color:var(--border)}
+.tab-button.active{color:var(--text);border-bottom-color:var(--accent)}
+.tab-key{font-size:.65rem;line-height:1;border:1px solid var(--border);border-radius:4px;padding:.14rem .28rem;color:var(--muted);background:var(--surface)}
+.tab-count{min-width:1.2rem;text-align:center;font-size:.68rem;border:1px solid var(--border);border-radius:999px;padding:.12rem .36rem;color:var(--muted);background:var(--surface)}
+.tab-panel[hidden]{display:none}
+.log{display:flex;flex-direction:column;gap:.5rem}
+.log-entry{padding:.75rem 1rem;opacity:0;transform:translateX(20px);animation:slideIn .3s ease forwards}
+@keyframes slideIn{to{opacity:1;transform:translateX(0)}}
+.log-top{display:flex;justify-content:space-between;gap:.75rem;align-items:flex-start}
+.log-actions{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.log-meta{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:.35rem}
+.log-text{font-size:.9rem;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
+.log-tags{display:flex;gap:.35rem;flex-wrap:wrap;margin-top:.35rem}
+.tag{font-size:.7rem;padding:.15rem .45rem;border-radius:3px;border:1px solid rgba(59,130,246,0.3);color:var(--accent);background:var(--accent-dim)}
+.tag.work{color:var(--green);background:rgba(34,197,94,0.15);border-color:rgba(34,197,94,0.3)}
+.tag.personal{color:#a78bfa;background:rgba(167,139,250,0.15);border-color:rgba(167,139,250,0.3)}
+.empty{color:var(--muted);font-style:italic;padding:2rem;text-align:center}
+@media (max-width:720px){
+  body{padding:1rem}
+  .upload-grid,.field-row{grid-template-columns:1fr}
+  .model-row{grid-template-columns:1fr}
+  .modal-actions{justify-content:flex-start}
+  .job-head,.log-top{flex-direction:column}
+  .job-actions{justify-content:flex-start}
+  .status-bar{gap:.75rem}
+}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>kloyce <span>dashboard</span></h1>
+  <div class="header-actions">
+    <div class="gpu-badge" id="gpu-badge"></div>
+    <button id="open-settings" type="button">Settings</button>
+  </div>
+</div>
+<div class="status-bar">
+  <div class="status-indicator"><div class="dot" id="dot"></div><span id="state">idle</span></div>
+  <div class="stat">transcriptions: <strong id="total">0</strong></div>
+  <div class="stat">words: <strong id="words">0</strong></div>
+  <div class="stat">uptime: <strong id="uptime">0s</strong></div>
+</div>
+<div class="activity" id="activity"><div class="activity-inner"><div class="activity-label" id="activity-label"></div><div id="activity-content"></div></div></div>
+
+<div class="modal-backdrop hidden" id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2 id="settings-title">Dashboard Settings</h2>
+        <div class="hint">Transcription defaults apply to new file selections.</div>
+      </div>
+      <button id="close-settings" type="button">Close</button>
+    </div>
+    <form id="dashboard-settings-form">
+      <div class="modal-body">
+        <div class="field-row">
+          <div class="field">
+            <label for="default-mode-select">Default mode</label>
+            <select id="default-mode-select"></select>
+            <div class="field-help" id="default-mode-help"></div>
+          </div>
+          <div class="field">
+            <label for="default-standard-model-select">Default standard model</label>
+            <select id="default-standard-model-select"></select>
+            <div class="field-help">Any catalog model can be saved; only installed models can run.</div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="default-diarized-model">Default diarized model</label>
+          <input id="default-diarized-model" type="text">
+          <div class="field-help">Used by diarized file jobs when advanced transcription is available.</div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label><input id="filler-removal-check" type="checkbox"> Remove filler words (uh, um, hmm&hellip;)</label>
+            <div class="field-help">Instantly strips common speech fillers before transcription cleanup.</div>
+          </div>
+          <div class="field">
+            <label for="cleanup-engine-select">Cleanup engine</label>
+            <select id="cleanup-engine-select">
+              <option value="none">None</option>
+              <option value="local">Local LLM (llama-cli)</option>
+              <option value="claude">Claude</option>
+            </select>
+            <div class="field-help">Contextual grammar cleanup after filler removal and dictionary correction.</div>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label><input id="hotkey-audio-retention-check" type="checkbox"> Retain hotkey audio</label>
+            <div class="field-help">Successful hotkey recordings are kept for copy+ payloads.</div>
+          </div>
+          <div class="field">
+            <label for="hotkey-audio-retention-days">Retention days</label>
+            <input id="hotkey-audio-retention-days" type="number" min="0" max="3650" step="1">
+            <div class="field-help">0 expires immediately; cleanup runs in the background.</div>
+          </div>
+        </div>
+        <div>
+          <div class="section-header">Mode Availability</div>
+          <div class="settings-status-list" id="settings-mode-status"></div>
+        </div>
+        <div>
+          <div class="section-header">Standard Models</div>
+          <div class="model-list" id="standard-model-list"></div>
+        </div>
+        <div class="notice" id="settings-notice"></div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" id="cancel-settings">Cancel</button>
+        <button class="primary" id="save-settings" type="submit">Save Defaults</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="gpu-section">
+  <div class="section-header">GPU Monitor</div>
+  <div class="gpu-unavailable" id="gpu-unavailable">No GPU detected</div>
+  <div class="gpu-content" id="gpu-content">
+    <div class="sparkline-wrap"><canvas id="gpu-canvas"></canvas><div class="sparkline-label" id="gpu-util-label">--%</div></div>
+    <div class="vram-bar"><div class="vram-fill" id="vram-fill"></div><div class="vram-label" id="vram-label">VRAM: -- / -- GB</div></div>
+    <div class="gauges" id="gauges"></div>
+  </div>
+</div>
+
+<div class="tabs" role="tablist" aria-label="Dashboard sections">
+  <button class="tab-button active" id="tab-work" type="button" role="tab" aria-selected="true" aria-controls="panel-work" data-tab="work">
+    <span>Work</span><span class="tab-key">W</span><span class="tab-count" id="work-tab-count">0</span>
+  </button>
+  <button class="tab-button" id="tab-log" type="button" role="tab" aria-selected="false" aria-controls="panel-log" data-tab="log">
+    <span>Log</span><span class="tab-key">L</span><span class="tab-count" id="log-tab-count">0</span>
+  </button>
+</div>
+
+<div class="tab-panel" id="panel-work" role="tabpanel" aria-labelledby="tab-work">
+  <div class="section">
+    <div class="section-header">File Transcription</div>
+    <div class="panel upload-grid">
+      <label class="drop-zone" id="drop-zone" for="file-input">
+        <strong id="file-name">Drop MP4, MP3, or WAV here</strong>
+        <span>or choose a file from disk</span>
+        <input class="file-input" id="file-input" type="file" accept="audio/*,video/mp4,.mp3,.wav,.mp4">
+      </label>
+      <form class="settings-form hidden" id="upload-settings">
+        <div class="field-row">
+          <div class="field">
+            <label for="mode-select">Mode</label>
+            <select id="mode-select"></select>
+            <div class="field-help" id="mode-help"></div>
+          </div>
+          <div class="field">
+            <label for="model-select">Model</label>
+            <select id="model-select"></select>
+            <div class="field-help" id="model-help"></div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="context-tags">Context tags</label>
+          <input id="context-tags" type="text" placeholder="work/client, personal/note">
+        </div>
+        <div class="upload-actions">
+          <button class="primary" id="submit-job" type="submit">Queue File</button>
+          <button id="clear-file" type="button">Clear</button>
+          <span class="hint">Ctrl+Enter submits</span>
+        </div>
+        <div class="notice" id="upload-notice"></div>
+      </form>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">Upload Queue</div>
+    <div class="jobs" id="jobs"><div class="empty">No file jobs yet.</div></div>
+  </div>
+</div>
+
+<div class="tab-panel" id="panel-log" role="tabpanel" aria-labelledby="tab-log" hidden>
+  <div class="section-header">Transcription Log</div>
+  <div class="log" id="log"><div class="empty" id="empty">No transcriptions yet. Press hotkey to start recording.</div></div>
+</div>
+<script>
+var $=function(id){return document.getElementById(id)};
+var ARC='M 15 78 A 42 42 0 1 1 85 78';
+var state={settings:null,modes:[],standardModels:[],selectedFile:null,uploading:false,savingSettings:false,modelPoll:null,activeTab:'work',logCount:0};
+var TRANSCRIPTION_MODES=['standard','diarized'];
+var DIARIZED_MODELS=['tiny','base','small','medium','large-v2','large-v3'];
+var TRANSCRIPTION_SETTINGS_PATH='/api/transcription/settings';
+var STANDARD_MODELS_PATH='/api/models/standard';
+var CANCEL_JOB_PATH_TEMPLATE='/api/jobs/{id}/cancel';
+var DOWNLOAD_MODEL_PATH_TEMPLATE='/api/models/standard/{model_id}/download';
+var DEFAULT_UPLOAD_PROMPT='Drop MP4, MP3, or WAV here';
+var TAB_STORAGE_KEY='kloyce.activeTab';
+var TABS=['work','log'];
+var TERMINAL_JOB_STATUSES=['succeeded','failed','cancelled'];
+var CANCELLABLE_JOB_STATUSES=['queued','preparing_media','downloading_model','transcribing'];
+
+[['temp','TEMP'],['power','POWER'],['fan','FAN']].forEach(function(g){
+  var d=document.createElement('div');d.className='gauge';
+  d.innerHTML='<svg viewBox="0 0 100 100"><path d="'+ARC+'" fill="none" stroke="#262626" stroke-width="8" stroke-linecap="round"/><path d="'+ARC+'" fill="none" stroke-width="8" stroke-linecap="round" class="gauge-arc" id="'+g[0]+'-arc"/><text x="50" y="55" text-anchor="middle" fill="var(--text)" font-size="16" font-weight="600" id="'+g[0]+'-value">--</text><text x="50" y="70" text-anchor="middle" fill="#737373" font-size="9">'+g[1]+'</text></svg>';
+  $('gauges').appendChild(d);
+});
+
+function formatUptime(s){if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
+function formatTime(t){return new Date(t).toLocaleTimeString()}
+function escapeHtml(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML}
+function titleCase(s){return String(s||'').replace(/_/g,' ').replace(/\b\w/g,function(c){return c.toUpperCase()})}
+function isTerminal(status){return TERMINAL_JOB_STATUSES.indexOf(status)>=0}
+function isCancellable(status){return CANCELLABLE_JOB_STATUSES.indexOf(status)>=0}
+function modeInfo(mode){
+  return state.modes.filter(function(m){return m.mode===mode})[0]||{
+    mode:mode,
+    available:false,
+    reason:'Mode availability unknown'
+  };
+}
+function selectedMode(){return $('mode-select').value||'standard'}
+function selectedModel(){
+  if(selectedMode()==='standard')return $('model-select').value;
+  var select=$('model-select');
+  var opt=select.options[select.selectedIndex];
+  return opt?opt.value:'';
+}
+function setNotice(message,kind){
+  var n=$('upload-notice');n.textContent=message||'';n.className='notice'+(kind?' '+kind:'');
+}
+function parseJsonOrThrow(response){
+  return response.json().then(function(body){
+    if(!response.ok)throw body;
+    return body;
+  });
+}
+function settingsDefaults(){return (state.settings&&state.settings.defaults)||{}}
+function settingsPipelineDefaults(){return{filler_removal:state.settings?state.settings.filler_removal!==false:true,cleanup_engine:(state.settings&&state.settings.cleanup_engine)||'none'};}
+function settingsRetentionDefaults(){return{hotkey_audio_retention_enabled:state.settings?state.settings.hotkey_audio_retention_enabled!==false:true,hotkey_audio_retention_days:state.settings&&state.settings.hotkey_audio_retention_days!=null?state.settings.hotkey_audio_retention_days:7};}
+function availabilityLabel(info){return info.available?'Ready':(info.reason||'Unavailable')}
+function isValidTab(tab){return TABS.indexOf(tab)>=0}
+function storedTab(){
+  try{return localStorage.getItem(TAB_STORAGE_KEY)}catch(e){return null}
+}
+function storeTab(tab){
+  try{localStorage.setItem(TAB_STORAGE_KEY,tab)}catch(e){}
+}
+function setActiveTab(tab,persist){
+  if(!isValidTab(tab))tab='work';
+  state.activeTab=tab;
+  TABS.forEach(function(name){
+    var active=name===tab;
+    var button=$('tab-'+name);
+    var panel=$('panel-'+name);
+    if(button){
+      button.classList.toggle('active',active);
+      button.setAttribute('aria-selected',active?'true':'false');
+    }
+    if(panel)panel.hidden=!active;
+  });
+  if(persist!==false)storeTab(tab);
+}
+function isTypingTarget(target){
+  if(!target)return false;
+  var tag=(target.tagName||'').toLowerCase();
+  return target.isContentEditable||tag==='input'||tag==='select'||tag==='textarea';
+}
+function settingsModalOpen(){
+  return !$('settings-modal').classList.contains('hidden');
+}
+function handleTabHotkey(e){
+  if(e.ctrlKey||e.metaKey||e.altKey||e.shiftKey||settingsModalOpen()||isTypingTarget(e.target))return;
+  var key=String(e.key||'').toLowerCase();
+  if(key==='w'||key==='l'){
+    e.preventDefault();
+    setActiveTab(key==='w'?'work':'log');
+  }
+}
+function updateWorkTabCount(count){$('work-tab-count').textContent=count}
+function updateLogTabCount(){$('log-tab-count').textContent=state.logCount}
+
+var currentState='idle';
+function setState(s){
+  var dot=$('dot'),prev=currentState;currentState=s;
+  $('state').textContent=s;
+  dot.className=dotClass(s);
+  if(prev!==s){dot.classList.add('pop');setTimeout(function(){dot.classList.remove('pop')},200)}
+  updateActivity(s);
+}
+function dotClass(s){
+  if(s==='recording')return'dot recording';
+  if(s==='transcribing')return'dot transcribing';
+  return'dot';
+}
+function updateStatus(data){
+  setState(data.state);
+  if(data.metrics){
+    $('total').textContent=data.metrics.total_transcriptions;
+    $('words').textContent=data.metrics.total_words;
+    $('uptime').textContent=formatUptime(data.metrics.uptime_secs);
+  }
+}
+function updateActivity(s){
+  var el=$('activity');el.className='activity';
+  if(s==='recording'){
+    el.classList.add('active','recording');
+    $('activity-label').innerHTML='<strong>Recording:</strong> <span id="rec-time">0.0s</span>';
+    var b='';for(var i=0;i<20;i++)b+='<div class="bar" style="animation-delay:'+(i*0.04)+'s"></div>';
+    $('activity-content').innerHTML='<div class="waveform">'+b+'</div>';
+  }else if(s==='transcribing'){
+    el.classList.add('active','transcribing');
+    $('activity-label').innerHTML='<strong id="trans-label">Transcribing:</strong> <span id="trans-pct">0%</span> <span style="color:var(--muted);font-size:.8rem" id="trans-elapsed"></span>';
+    $('activity-content').innerHTML='<div class="progress-outer"><div class="progress-inner" id="trans-bar"></div></div>';
+  }
+}
+
+function loadSettings(options){
+  options=options||{};
+  return Promise.all([
+    fetch(TRANSCRIPTION_SETTINGS_PATH).then(parseJsonOrThrow),
+    fetch(STANDARD_MODELS_PATH).then(parseJsonOrThrow)
+  ]).then(function(values){
+    var preserveUploadSelection=state.selectedFile&&!options.resetUploadDefaults;
+    state.settings=values[0];
+    state.modes=values[0].mode_availability||[];
+    state.standardModels=values[1].models||[];
+    renderModeSelector(preserveUploadSelection);
+    renderModelSelector(preserveUploadSelection);
+    renderSettingsModal(options.settingsDraft);
+    refreshModelDownloadPolling();
+  }).catch(function(){
+    setNotice('Unable to load transcription settings.','error');
+    setSettingsNotice('Unable to load transcription settings.','error');
+  });
+}
+function renderModeSelector(preserveSelection){
+  var sel=$('mode-select'),defaults=settingsDefaults();
+  var current=preserveSelection===true&&sel.value?sel.value:(defaults.default_mode||'standard');
+  sel.innerHTML='';
+  TRANSCRIPTION_MODES.forEach(function(mode){
+    var info=modeInfo(mode);
+    var opt=document.createElement('option');
+    opt.value=mode;
+    opt.textContent=titleCase(mode);
+    opt.disabled=!info.available;
+    if(!info.available&&info.reason)opt.textContent+=' - unavailable';
+    sel.appendChild(opt);
+  });
+  sel.value=current;
+  renderModeHelp();
+}
+function renderModeHelp(){
+  var info=modeInfo(selectedMode());
+  $('mode-help').textContent=availabilityLabel(info);
+}
+function renderModelSelector(preserveSelection){
+  var sel=$('model-select'),defaults=settingsDefaults();
+  sel.innerHTML='';
+  if(selectedMode()==='diarized'){
+    var def=defaults.default_diarized_model||'large-v3';
+    var models=DIARIZED_MODELS.slice();
+    if(models.indexOf(def)<0)models.unshift(def);
+    var prevDiar=preserveSelection===true&&sel.value&&models.indexOf(sel.value)>=0?sel.value:def;
+    models.forEach(function(model){
+      var opt=document.createElement('option');
+      opt.value=model;
+      opt.textContent=model+(model===def?' (default)':'');
+      sel.appendChild(opt);
+    });
+    sel.value=prevDiar;
+    $('model-help').textContent='WhisperX models download automatically on first diarized job';
+    renderModeHelp();
+    return;
+  }
+  var preferred=preserveSelection===true&&sel.value?sel.value:(defaults.default_standard_model||'small.en');
+  state.standardModels.forEach(function(model){
+    var opt=document.createElement('option');
+    opt.value=model.id;
+    opt.textContent=model.label+' ('+model.status+')';
+    opt.disabled=model.status!=='installed';
+    opt.title=model.status==='installed'?model.path:(model.error||'Model is not installed');
+    sel.appendChild(opt);
+  });
+  if(state.standardModels.length===0){
+    var empty=document.createElement('option');
+    empty.value=preferred;
+    empty.textContent=preferred;
+    empty.disabled=true;
+    sel.appendChild(empty);
+  }
+  sel.value=preferred;
+  $('model-help').textContent='Only installed standard models can be queued';
+  renderModeHelp();
+}
+
+function setSettingsNotice(message,kind){
+  var n=$('settings-notice');if(!n)return;
+  n.textContent=message||'';n.className='notice'+(kind?' '+kind:'');
+}
+function currentSettingsDraft(){
+  var defaults=settingsDefaults();
+  var pipeline=settingsPipelineDefaults();
+  var retention=settingsRetentionDefaults();
+  var fillerCheck=$('filler-removal-check');
+  var retentionCheck=$('hotkey-audio-retention-check');
+  var retentionDays=parseInt(($('hotkey-audio-retention-days')&&$('hotkey-audio-retention-days').value)||retention.hotkey_audio_retention_days,10);
+  if(isNaN(retentionDays))retentionDays=retention.hotkey_audio_retention_days;
+  return {
+    default_mode:$('default-mode-select').value||defaults.default_mode||'standard',
+    default_standard_model:$('default-standard-model-select').value||defaults.default_standard_model||'large-v3-turbo',
+    default_diarized_model:($('default-diarized-model').value||defaults.default_diarized_model||'small').trim(),
+    filler_removal:fillerCheck?fillerCheck.checked:pipeline.filler_removal,
+    cleanup_engine:($('cleanup-engine-select')&&$('cleanup-engine-select').value)||pipeline.cleanup_engine,
+    hotkey_audio_retention_enabled:retentionCheck?retentionCheck.checked:retention.hotkey_audio_retention_enabled,
+    hotkey_audio_retention_days:retentionDays
+  };
+}
+function renderSettingsModal(draft){
+  var defaults=settingsDefaults();
+  var pipeline=settingsPipelineDefaults();
+  var retention=settingsRetentionDefaults();
+  draft=draft||defaults;
+  renderDefaultModeSelect(draft.default_mode||'standard');
+  renderDefaultStandardModelSelect(draft.default_standard_model||'large-v3-turbo');
+  $('default-diarized-model').value=draft.default_diarized_model||defaults.default_diarized_model||'small';
+  var fillerCheck=$('filler-removal-check');
+  if(fillerCheck)fillerCheck.checked=draft.hasOwnProperty('filler_removal')?draft.filler_removal:pipeline.filler_removal;
+  var engineSel=$('cleanup-engine-select');
+  if(engineSel)engineSel.value=draft.cleanup_engine||pipeline.cleanup_engine;
+  var retentionCheck=$('hotkey-audio-retention-check');
+  if(retentionCheck)retentionCheck.checked=draft.hasOwnProperty('hotkey_audio_retention_enabled')?draft.hotkey_audio_retention_enabled:retention.hotkey_audio_retention_enabled;
+  var retentionDays=$('hotkey-audio-retention-days');
+  if(retentionDays)retentionDays.value=draft.hotkey_audio_retention_days!=null?draft.hotkey_audio_retention_days:retention.hotkey_audio_retention_days;
+  renderRetentionControlState();
+  renderModeStatus();
+  renderStandardModelList();
+}
+function renderRetentionControlState(){
+  var check=$('hotkey-audio-retention-check'),days=$('hotkey-audio-retention-days');
+  if(check&&days)days.disabled=!check.checked;
+}
+function renderDefaultModeSelect(current){
+  var sel=$('default-mode-select');
+  sel.innerHTML='';
+  TRANSCRIPTION_MODES.forEach(function(mode){
+    var info=modeInfo(mode);
+    var opt=document.createElement('option');
+    opt.value=mode;
+    opt.textContent=titleCase(mode);
+    if(mode==='diarized'&&!info.available)opt.disabled=true;
+    sel.appendChild(opt);
+  });
+  sel.value=current;
+  renderDefaultModeHelp();
+}
+function renderDefaultModeHelp(){
+  var mode=$('default-mode-select').value||'standard';
+  var info=modeInfo(mode);
+  $('default-mode-help').textContent=availabilityLabel(info);
+}
+function renderDefaultStandardModelSelect(current){
+  var sel=$('default-standard-model-select');
+  sel.innerHTML='';
+  state.standardModels.forEach(function(model){
+    var opt=document.createElement('option');
+    opt.value=model.id;
+    opt.textContent=model.label+' ('+model.status+')';
+    sel.appendChild(opt);
+  });
+  if(state.standardModels.length===0){
+    var empty=document.createElement('option');
+    empty.value=current;
+    empty.textContent=current;
+    sel.appendChild(empty);
+  }
+  sel.value=current;
+}
+function renderModeStatus(){
+  var wrap=$('settings-mode-status');
+  wrap.innerHTML='';
+  state.modes.forEach(function(info){
+    var row=document.createElement('div');
+    var statusClass=info.available?'status-succeeded':'status-failed';
+    var statusText=info.available?'Available':'Unavailable';
+    row.className='settings-status';
+    row.innerHTML='<div><strong>'+escapeHtml(titleCase(info.mode))+'</strong><span>'+escapeHtml(availabilityLabel(info))+'</span></div><span class="status-pill '+statusClass+'">'+statusText+'</span>';
+    wrap.appendChild(row);
+  });
+  if(state.modes.length===0)wrap.innerHTML='<div class="empty">Mode availability unavailable.</div>';
+}
+function renderStandardModelList(){
+  var wrap=$('standard-model-list');
+  wrap.innerHTML='';
+  state.standardModels.forEach(function(model){
+    var row=document.createElement('div');
+    row.className='model-row';
+    row.innerHTML=modelSummaryHtml(model)+'<div>'+modelActionHtml(model)+'</div>';
+    var button=row.querySelector('[data-model-id]');
+    if(button)button.addEventListener('click',function(){downloadStandardModel(model.id,button)});
+    wrap.appendChild(row);
+  });
+  if(state.standardModels.length===0)wrap.innerHTML='<div class="empty">No standard models reported.</div>';
+}
+function modelSummaryHtml(model){
+  var pathText=model.error||model.path||model.filename;
+  return '<div class="model-name"><strong>'+escapeHtml(model.label)+'</strong><div class="model-meta"><span>'+escapeHtml(model.id)+'</span><span class="model-status '+escapeHtml(model.status)+'">'+escapeHtml(titleCase(model.status))+'</span></div><span class="model-path">'+escapeHtml(pathText)+'</span></div>';
+}
+function modelActionHtml(model){
+  if(model.status==='installed')return'<span class="hint">Installed</span>';
+  if(model.status==='downloading')return'<button type="button" disabled>Downloading</button>';
+  return'<button type="button" data-model-id="'+escapeHtml(model.id)+'">Download</button>';
+}
+function downloadStandardModel(modelId,button){
+  var draft=currentSettingsDraft();
+  button.disabled=true;
+  button.textContent='Starting';
+  setSettingsNotice('Starting model download...');
+  fetch(DOWNLOAD_MODEL_PATH_TEMPLATE.replace('{model_id}',encodeURIComponent(modelId)),{method:'POST'})
+    .then(parseJsonOrThrow)
+    .then(function(body){
+      setSettingsNotice(body.message||'Model download queued.','ok');
+      return loadSettings({settingsDraft:draft,resetUploadDefaults:false});
+    })
+    .catch(function(error){
+      setSettingsNotice(error&&error.message?error.message:'Model download failed.','error');
+      return loadSettings({settingsDraft:draft,resetUploadDefaults:false});
+    });
+}
+function refreshModelDownloadPolling(){
+  var active=state.standardModels.some(function(model){return model.status==='downloading'});
+  if(active&&!state.modelPoll){
+    state.modelPoll=setInterval(function(){
+      var draft=$('settings-modal').classList.contains('hidden')?null:currentSettingsDraft();
+      loadSettings({settingsDraft:draft,resetUploadDefaults:false});
+    },2500);
+  }else if(!active&&state.modelPoll){
+    clearInterval(state.modelPoll);
+    state.modelPoll=null;
+  }
+}
+function openSettingsModal(){
+  $('settings-modal').classList.remove('hidden');
+  setSettingsNotice('');
+  renderSettingsModal();
+  loadSettings({settingsDraft:currentSettingsDraft(),resetUploadDefaults:false});
+}
+function closeSettingsModal(){
+  $('settings-modal').classList.add('hidden');
+}
+function saveDashboardSettings(){
+  if(state.savingSettings)return;
+  var draft=currentSettingsDraft();
+  var diarized=modeInfo('diarized');
+  if(draft.default_mode==='diarized'&&!diarized.available){
+    setSettingsNotice(diarized.reason||'Diarized mode is unavailable.','error');
+    return;
+  }
+  state.savingSettings=true;
+  $('save-settings').disabled=true;
+  setSettingsNotice('Saving defaults...');
+  fetch('/api/transcription/settings',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(draft)
+  }).then(parseJsonOrThrow).then(function(){
+    setSettingsNotice('Defaults saved.','ok');
+    return loadSettings({resetUploadDefaults:!state.selectedFile});
+  }).catch(function(error){
+    setSettingsNotice(error&&error.message?error.message:'Failed to save defaults.','error');
+  }).finally(function(){
+    state.savingSettings=false;
+    $('save-settings').disabled=false;
+  });
+}
+
+function setSelectedFile(file){
+  state.selectedFile=file||null;
+  if(file){
+    renderModeSelector(false);
+    renderModelSelector(false);
+    $('file-name').textContent=file.name;
+    $('upload-settings').classList.remove('hidden');
+    setNotice('Ready to queue '+file.name+'.','ok');
+  }else{
+    $('file-name').textContent=DEFAULT_UPLOAD_PROMPT;
+    $('file-input').value='';
+    $('upload-settings').classList.add('hidden');
+    setNotice('');
+  }
+}
+function parseTags(value){
+  return String(value||'').split(',').map(function(t){return t.trim()}).filter(Boolean).join(',');
+}
+function submitUpload(){
+  if(state.uploading)return;
+  if(!state.selectedFile){setNotice('Choose a media file first.','error');return}
+  var mode=selectedMode(),info=modeInfo(mode);
+  if(!info.available){setNotice(info.reason||'Selected mode is unavailable.','error');return}
+  var model=selectedModel();
+  if(!model){setNotice('Choose an installed model.','error');return}
+  var data=new FormData();
+  data.append('file',state.selectedFile);
+  data.append('mode',mode);
+  data.append('model',model);
+  data.append('context_tags',parseTags($('context-tags').value));
+  if(mode==='diarized')data.append('diarize','true');
+  setUploadSubmitting(true);
+  setNotice('Uploading and queueing file...');
+  fetch('/api/jobs/upload',{method:'POST',body:data}).then(parseJsonOrThrow).then(function(){
+    setSelectedFile(null);
+    setNotice('File queued.','ok');
+    loadJobs();
+  }).catch(function(error){
+    setNotice(error&&error.message?error.message:'Upload failed.','error');
+  }).finally(function(){
+    setUploadSubmitting(false);
+  });
+}
+function setUploadSubmitting(uploading){
+  state.uploading=uploading;
+  $('submit-job').disabled=uploading;
+}
+
+function copyText(text,button){
+  var done=function(){
+    if(!button)return;
+    var old=button.textContent;
+    button.textContent='Copied';
+    setTimeout(function(){button.textContent=old},1000);
+  };
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done).catch(function(){fallbackCopy(text);done()});
+  }else{fallbackCopy(text);done()}
+}
+function fallbackCopy(text){
+  var area=document.createElement('textarea');
+  area.value=text;area.setAttribute('readonly','');area.style.position='fixed';area.style.left='-9999px';
+  document.body.appendChild(area);area.select();document.execCommand('copy');area.remove();
+}
+function copyTranscriptText(job){
+  if(!job||!job.result)return'';
+  if(job.result.text)return job.result.text;
+  if(job.mode==='diarized'&&job.result.segments){
+    return job.result.segments.map(function(segment){
+      return (segment.speaker?segment.speaker+': ':'')+(segment.text||'').trim();
+    }).join('\n');
+  }
+  return '';
+}
+function markdownFenceFor(text){
+  var max=0,run=0,s=String(text||'');
+  for(var i=0;i<s.length;i++){
+    if(s.charAt(i)==='`'){run++;if(run>max)max=run}else{run=0}
+  }
+  return '`'.repeat(Math.max(max,2)+1);
+}
+function transcriptFilename(entry){
+  return entry&&entry.recording_id?'kloyce-'+entry.recording_id+'.txt':'transcript.txt';
+}
+function copyPlusTranscriptText(entry){
+  var text=(entry&&entry.text)||'';
+  var fence=markdownFenceFor(text);
+  var tags=entry&&entry.context_tags&&entry.context_tags.length?entry.context_tags.join(', '):'none';
+  var audioPath=entry&&entry.audio_path&&!entry.audio_cleaned_at?entry.audio_path:'unavailable';
+  var expires=entry&&entry.audio_expires_at?entry.audio_expires_at:'unavailable';
+  var payload=fence+'{'+transcriptFilename(entry)+'}\n'+text+(text.endsWith('\n')?'':'\n')+fence+'\n\n';
+  payload+='audio_path: '+audioPath+'\n';
+  payload+='audio_expires_at: '+expires+'\n';
+  payload+='recorded_at: '+((entry&&entry.timestamp)||'unavailable')+'\n';
+  payload+='duration_secs: '+((entry&&entry.duration_secs!=null)?entry.duration_secs:'unavailable')+'\n';
+  payload+='word_count: '+((entry&&entry.word_count!=null)?entry.word_count:'unavailable')+'\n';
+  payload+='context_tags: '+tags+'\n\n';
+  payload+='[voice transcript - if anything is unclear, ask for clarification]';
+  return payload;
+}
+function tagClass(t){
+  if(t.indexOf('work/')===0)return'work';
+  if(t.indexOf('personal/')===0)return'personal';
+  return'';
+}
+function addEntry(entry,animate){
+  var empty=$('empty');if(empty)empty.remove();
+  state.logCount+=1;
+  updateLogTabCount();
+  var div=document.createElement('div');div.className='log-entry';
+  if(!animate){div.style.animation='none';div.style.opacity='1';div.style.transform='none'}
+  var tagsHtml='';
+  if(entry.context_tags&&entry.context_tags.length>0){
+    tagsHtml='<div class="log-tags">'+entry.context_tags.map(function(t){return'<span class="tag '+tagClass(t)+'">'+escapeHtml(t)+'</span>'}).join('')+'</div>';
+  }
+  var audioMeta=entry.audio_path&&!entry.audio_cleaned_at?'<span>'+escapeHtml(entry.audio_filename||'audio retained')+'</span>':'';
+  div.innerHTML='<div class="log-top"><div><div class="log-meta"><span>'+formatTime(entry.timestamp)+'</span><span>'+entry.duration_secs+'s</span><span>'+entry.word_count+' words</span>'+audioMeta+'</div>'+tagsHtml+'</div><div class="log-actions"><button type="button" class="copy-log">Copy</button><button type="button" class="copy-plus-log">Copy +</button></div></div><div class="log-text">'+escapeHtml(entry.text)+'</div>';
+  div.querySelector('.copy-log').addEventListener('click',function(e){copyText(entry.text,e.currentTarget)});
+  div.querySelector('.copy-plus-log').addEventListener('click',function(e){copyText(copyPlusTranscriptText(entry),e.currentTarget)});
+  $('log').prepend(div);
+}
+
+function loadJobs(){
+  fetch('/api/jobs').then(function(r){return r.json()}).then(function(data){renderJobs(data.jobs||[])}).catch(function(){});
+}
+function renderJobs(jobs){
+  var wrap=$('jobs');
+  var activeCount=jobs.filter(function(job){return !isTerminal(job.status)}).length;
+  updateWorkTabCount(activeCount);
+  if(!jobs.length){wrap.innerHTML='<div class="empty">No file jobs yet.</div>';return}
+  wrap.innerHTML='';
+  jobs.forEach(function(job){
+    var card=document.createElement('div');card.className='job-card';
+    var statusClass='status-'+job.status;
+    card.innerHTML=
+      '<div class="job-head">'+
+        '<div class="job-title"><strong>'+escapeHtml(job.source_filename)+'</strong>'+renderJobMeta(job)+'</div>'+
+        '<div class="job-actions"><span class="status-pill '+statusClass+'">'+escapeHtml(titleCase(job.status))+'</span>'+renderJobActions(job)+'</div>'+
+      '</div>'+
+      renderJobProgress(job)+
+      renderJobBody(job);
+    bindJobActions(card,job);
+    wrap.appendChild(card);
+  });
+}
+function renderJobMeta(job){
+  return '<div class="job-meta">'+
+    '<span>'+escapeHtml(job.mode)+'</span>'+
+    '<span>'+escapeHtml(job.settings&&job.settings.model)+'</span>'+
+    '<span>'+escapeHtml(jobStats(job).join(' / '))+'</span>'+
+  '</div>';
+}
+function jobStats(job){
+  var result=job.result||{};
+  var stats=[];
+  if(result.duration_secs!=null)stats.push(result.duration_secs+'s');
+  if(result.word_count!=null)stats.push(result.word_count+' words');
+  if(result.speaker_count!=null)stats.push(result.speaker_count+' speakers');
+  return stats;
+}
+function renderJobActions(job){
+  var actions='';
+  if(job.status==='succeeded'&&job.result){
+    actions+='<button type="button" data-action="copy">Copy</button>';
+  }
+  if(isCancellable(job.status)){
+    actions+='<button type="button" class="danger" data-action="cancel" '+(job.cancel_requested?'disabled':'')+'>'+(job.cancel_requested?'Cancelling':'Cancel')+'</button>';
+  }
+  return actions;
+}
+function renderJobProgress(job){
+  if(isTerminal(job.status)&&!(job.progress_pct>0))return'';
+  return '<div class="progress-outer"><div class="progress-inner" style="width:'+progressWidth(job.progress_pct)+'%"></div></div>';
+}
+function renderJobBody(job){
+  var body='';
+  if(job.error_message)body+='<div class="job-error">'+escapeHtml(job.error_message)+'</div>';
+  if(job.status==='succeeded'&&job.result)body+='<div class="job-result">'+escapeHtml(copyTranscriptText(job))+'</div>';
+  return body;
+}
+function bindJobActions(card,job){
+  var copy=card.querySelector('[data-action="copy"]');
+  if(copy)copy.addEventListener('click',function(e){copyText(copyTranscriptText(job),e.currentTarget)});
+  var cancel=card.querySelector('[data-action="cancel"]');
+  if(cancel)cancel.addEventListener('click',function(){cancelJob(job.id,cancel)});
+}
+function progressWidth(value){return Math.min(value||0,100)}
+function cancelJob(id,button){
+  button.disabled=true;button.textContent='Cancelling';
+  fetch(CANCEL_JOB_PATH_TEMPLATE.replace('{id}',id),{method:'POST'}).then(parseJsonOrThrow).then(function(){loadJobs()}).catch(function(){loadJobs()});
+}
+
+// GPU
+var gpuHistory=[],GPU_HISTORY_SIZE=30,gpuSeen=false;
+function drawSparkline(){
+  var canvas=$('gpu-canvas'),ctx=canvas.getContext('2d');
+  var dpr=window.devicePixelRatio||1,rect=canvas.getBoundingClientRect();
+  canvas.width=rect.width*dpr;canvas.height=rect.height*dpr;ctx.scale(dpr,dpr);
+  var w=rect.width,h=rect.height;ctx.clearRect(0,0,w,h);
+  ctx.strokeStyle='rgba(255,255,255,0.05)';ctx.lineWidth=1;
+  [0.25,0.5,0.75].forEach(function(p){var y=h*(1-p);ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()});
+  if(gpuHistory.length<2)return;
+  var grad=ctx.createLinearGradient(0,0,0,h);
+  grad.addColorStop(0,'rgba(59,130,246,0.3)');grad.addColorStop(1,'rgba(59,130,246,0.0)');
+  var step=w/(GPU_HISTORY_SIZE-1),off=GPU_HISTORY_SIZE-gpuHistory.length;
+  ctx.beginPath();ctx.moveTo(off*step,h);
+  gpuHistory.forEach(function(v,i){ctx.lineTo((off+i)*step,h*(1-v/100))});
+  ctx.lineTo((off+gpuHistory.length-1)*step,h);ctx.closePath();ctx.fillStyle=grad;ctx.fill();
+  ctx.beginPath();
+  gpuHistory.forEach(function(v,i){var x=(off+i)*step,y=h*(1-v/100);i===0?ctx.moveTo(x,y):ctx.lineTo(x,y)});
+  ctx.strokeStyle='#3b82f6';ctx.lineWidth=2;ctx.stroke();
+}
+function tempColor(p){if(p<0.5)return'#22c55e';if(p<0.75){var t=(p-0.5)/0.25;return'hsl('+(120-t*72)+',80%,50%)'}return'#ef4444'}
+function powerColor(p){if(p<0.7)return'#3b82f6';var t=(p-0.7)/0.3;return'rgb('+Math.round(59+t*180)+','+Math.round(130-t*62)+','+Math.round(246-t*178)+')'}
+function setGauge(arcId,valId,val,max,unit,colorFn){var p=Math.min(val/max,1),arc=$(arcId);arc.style.strokeDashoffset=220*(1-p);arc.style.stroke=colorFn(p);$(valId).textContent=Math.round(val)+unit}
+function showGpu(){if(!gpuSeen){gpuSeen=true;$('gpu-unavailable').style.display='none';$('gpu-content').style.display='block'}}
+function updateGpu(d){
+  showGpu();
+  var isAppleSilicon=d.gpu_name&&d.gpu_name.indexOf('Apple')===0;
+  if(d.gpu_name){var b=$('gpu-badge');b.textContent=d.gpu_name;b.style.display='inline-block'}
+  gpuHistory.push(d.utilization_pct);if(gpuHistory.length>GPU_HISTORY_SIZE)gpuHistory.shift();
+  $('gpu-util-label').textContent=d.utilization_pct+'%';drawSparkline();
+  var ug=(d.vram_used_mb/1024).toFixed(1),tg=(d.vram_total_mb/1024).toFixed(1);
+  $('vram-fill').style.width=(d.vram_used_mb/d.vram_total_mb*100)+'%';
+  $('vram-label').textContent=(isAppleSilicon?'Unified Memory: ':'VRAM: ')+ug+' / '+tg+' GB';
+  if(d.temperature_c===0&&d.power_draw_w===0&&d.fan_speed_pct===0){$('gauges').style.display='none'}
+  else{$('gauges').style.display='flex';setGauge('temp-arc','temp-value',d.temperature_c,100,'\u00b0',tempColor);setGauge('power-arc','power-value',d.power_draw_w,d.power_limit_w||350,'W',powerColor);setGauge('fan-arc','fan-value',d.fan_speed_pct,100,'%',function(){return'#3b82f6'})}
+}
+
+function refreshFromJobEvent(){clearTimeout(refreshFromJobEvent.t);refreshFromJobEvent.t=setTimeout(loadJobs,250)}
+function updateActivityProgress(label,event){
+  var pct=document.getElementById('trans-pct');
+  var bar=document.getElementById('trans-bar');
+  var elapsed=document.getElementById('trans-elapsed');
+  var labelEl=document.getElementById('trans-label');
+  if(labelEl)labelEl.textContent=label;
+  if(pct)pct.textContent=Math.round(event.progress_pct)+'%';
+  if(bar)bar.style.width=progressWidth(event.progress_pct)+'%';
+  if(elapsed)elapsed.textContent=event.elapsed_secs.toFixed(1)+'s';
+}
+function connectSSE(){
+  var es=new EventSource('/api/events');
+  es.onmessage=function(e){
+    var d=JSON.parse(e.data);
+    switch(d.type){
+      case 'state_change':
+        setState(d.state);
+        break;
+      case 'transcription':
+        addEntry(d,true);
+        $('total').textContent=parseInt($('total').textContent)+1;
+        $('words').textContent=parseInt($('words').textContent)+d.word_count;
+        break;
+      case 'diarized_transcription':
+        addEntry({timestamp:d.timestamp,duration_secs:d.duration_secs,word_count:d.word_count,text:d.full_text,context_tags:d.context_tags||[]},true);
+        break;
+      case 'gpu_metrics':
+        updateGpu(d);
+        break;
+      case 'recording_progress':
+        var el=document.getElementById('rec-time');
+        if(el)el.textContent=d.duration_secs.toFixed(1)+'s';
+        break;
+      case 'transcription_progress':
+        updateActivityProgress('Transcribing:',d);
+        break;
+      case 'cleanup_progress':
+        updateActivityProgress('Cleaning up:',d);
+        break;
+      default:
+        if(d.type&&d.type.indexOf('transcription_job_')===0)refreshFromJobEvent();
+        break;
+    }
+  };
+  es.onerror=function(){es.close();setTimeout(connectSSE,3000)};
+}
+
+$('file-input').addEventListener('change',function(e){setSelectedFile(e.target.files[0])});
+$('clear-file').addEventListener('click',function(){setSelectedFile(null)});
+$('upload-settings').addEventListener('submit',function(e){e.preventDefault();submitUpload()});
+$('mode-select').addEventListener('change',function(){renderModelSelector(false)});
+$('open-settings').addEventListener('click',openSettingsModal);
+$('close-settings').addEventListener('click',closeSettingsModal);
+$('cancel-settings').addEventListener('click',closeSettingsModal);
+$('settings-modal').addEventListener('click',function(e){if(e.target===$('settings-modal'))closeSettingsModal()});
+$('dashboard-settings-form').addEventListener('submit',function(e){e.preventDefault();saveDashboardSettings()});
+$('default-mode-select').addEventListener('change',renderDefaultModeHelp);
+$('hotkey-audio-retention-check').addEventListener('change',renderRetentionControlState);
+TABS.forEach(function(tab){
+  $('tab-'+tab).addEventListener('click',function(){setActiveTab(tab)});
+});
+['dragenter','dragover'].forEach(function(name){$('drop-zone').addEventListener(name,function(e){e.preventDefault();$('drop-zone').classList.add('dragging')})});
+['dragleave','drop'].forEach(function(name){$('drop-zone').addEventListener(name,function(e){e.preventDefault();$('drop-zone').classList.remove('dragging')})});
+$('drop-zone').addEventListener('drop',function(e){if(e.dataTransfer.files&&e.dataTransfer.files.length)setSelectedFile(e.dataTransfer.files[0])});
+document.addEventListener('keydown',function(e){if((e.ctrlKey||e.metaKey)&&e.key==='Enter'&&!$('upload-settings').classList.contains('hidden'))submitUpload()});
+document.addEventListener('keydown',function(e){if(e.key==='Escape'&&!$('settings-modal').classList.contains('hidden'))closeSettingsModal()});
+document.addEventListener('keydown',handleTabHotkey);
+
+setActiveTab(isValidTab(storedTab())?storedTab():'work',false);
+setTimeout(function(){if(!gpuSeen)$('gpu-unavailable').style.display='block'},6000);
+fetch('/api/status').then(function(r){return r.json()}).then(updateStatus).catch(function(){});
+fetch('/api/history').then(function(r){return r.json()}).then(function(e){e.reverse().forEach(function(x){addEntry(x,false)})}).catch(function(){});
+fetch('/api/gpu').then(function(r){return r.json()}).then(function(d){if(!d.error)updateGpu(d)}).catch(function(){});
+loadSettings();
+loadJobs();
+connectSSE();
+setInterval(function(){fetch('/api/status').then(function(r){return r.json()}).then(updateStatus).catch(function(){})},10000);
+setInterval(loadJobs,5000);
+window.addEventListener('resize',drawSparkline);
+</script>
+</body>
+</html>

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
+  "productName": "Kloyce",
+  "version": "0.1.0",
+  "identifier": "dev.pynch.kloyce",
+  "build": {
+    "frontendDist": "http://127.0.0.1:9876"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Kloyce Dashboard",
+        "width": 920,
+        "height": 700,
+        "resizable": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app"],
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/icon.png"
+    ],
+    "category": "Utility",
+    "shortDescription": "Push-to-talk speech-to-text",
+    "publisher": "Andrew Pynch",
+    "macOS": {
+      "entitlements": "entitlements.plist",
+      "minimumSystemVersion": "11.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc5OTNBQUVGN0M2NUJCNTQKUldSVXUyVjg3NnFUZVZmSUkyMkxxNjZqaGtjMjRmS3pQTzd4a3NOaVhYaGtYU1ZTUHh5Vnp0NlUK",
+      "endpoints": [
+        "https://github.com/andrew-pynch/kloyce/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}
