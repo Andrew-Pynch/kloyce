@@ -293,29 +293,9 @@ async fn main() {
             std::process::exit(1);
         }
         Ok(_) => {
-            if is_waybar {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(response.trim()) {
-                    let state = json.get("state").and_then(|s| s.as_str()).unwrap_or("idle");
-                    let (text, tooltip, class) = match state {
-                        "recording" => ("󰍬", "Recording... (Super+R to stop)", "recording"),
-                        "transcribing" => ("󰔟", "Transcribing...", "transcribing"),
-                        _ => ("", "Voice input (Super+R)", "idle"),
-                    };
-                    println!(r#"{{"text": "{text}", "tooltip": "{tooltip}", "class": "{class}"}}"#);
-                } else {
-                    println!(r#"{{"text": "", "tooltip": "Parse error", "class": "idle"}}"#);
-                }
-            } else if let Ok(json) = serde_json::from_str::<serde_json::Value>(response.trim()) {
-                if let Some(message) = json.get("message").and_then(|m| m.as_str()) {
-                    println!("{message}");
-                } else {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json).unwrap_or(response)
-                    );
-                }
-            } else {
-                print!("{response}");
+            let exit_code = print_daemon_response(&response, is_waybar);
+            if exit_code != 0 {
+                std::process::exit(exit_code);
             }
         }
         Err(e) => {
@@ -343,6 +323,50 @@ fn ipc_command_json(command: &Commands) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+/// Prints a daemon IPC response and returns the process exit code: 0 for a
+/// successful response, 1 when the daemon reported `status: "error"` (or
+/// the response could not be parsed as the expected non-waybar JSON
+/// shape). Waybar output always exits 0 since it renders a status widget
+/// rather than a pass/fail result.
+fn print_daemon_response(response: &str, is_waybar: bool) -> i32 {
+    if is_waybar {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(response.trim()) {
+            let state = json.get("state").and_then(|s| s.as_str()).unwrap_or("idle");
+            let (text, tooltip, class) = match state {
+                "recording" => ("󰍬", "Recording... (Super+R to stop)", "recording"),
+                "transcribing" => ("󰔟", "Transcribing...", "transcribing"),
+                _ => ("", "Voice input (Super+R)", "idle"),
+            };
+            println!(r#"{{"text": "{text}", "tooltip": "{tooltip}", "class": "{class}"}}"#);
+        } else {
+            println!(r#"{{"text": "", "tooltip": "Parse error", "class": "idle"}}"#);
+        }
+        return 0;
+    }
+
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(response.trim()) else {
+        print!("{response}");
+        return 0;
+    };
+
+    let status = json.get("status").and_then(|s| s.as_str()).unwrap_or("ok");
+    let message = json.get("message").and_then(|m| m.as_str());
+
+    if status == "error" {
+        eprintln!("{}", message.unwrap_or("Command failed"));
+        return 1;
+    }
+
+    match message {
+        Some(message) => println!("{message}"),
+        None => println!(
+            "{}",
+            serde_json::to_string_pretty(&json).unwrap_or_else(|_| response.to_string())
+        ),
+    }
+    0
 }
 
 fn file_job_options(command: &Commands) -> Option<FileJobOptions> {
@@ -726,6 +750,25 @@ mod tests {
             }),
             Some(r#"{"command":"retry_failed_transcription","id":null}"#.to_string())
         );
+    }
+
+    #[test]
+    fn print_daemon_response_exits_nonzero_on_error_status() {
+        let response = r#"{"status":"error","state":"idle","message":"Retry already in progress for failed hotkey transcription 3"}"#;
+        assert_eq!(print_daemon_response(response, false), 1);
+    }
+
+    #[test]
+    fn print_daemon_response_exits_zero_on_ok_status() {
+        let response =
+            r#"{"status":"ok","state":"idle","message":"Retrying failed hotkey transcription 3"}"#;
+        assert_eq!(print_daemon_response(response, false), 0);
+    }
+
+    #[test]
+    fn print_daemon_response_waybar_never_exits_nonzero() {
+        let response = r#"{"status":"error","state":"idle","message":"boom"}"#;
+        assert_eq!(print_daemon_response(response, true), 0);
     }
 
     #[test]

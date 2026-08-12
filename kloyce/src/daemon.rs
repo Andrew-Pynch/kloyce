@@ -352,6 +352,7 @@ mod tests {
                 Some(audio_path_str.as_str()),
                 Some("kloyce-failed-test.mp3"),
                 Some(Utc::now() - Duration::minutes(1)),
+                None,
             )
             .unwrap();
 
@@ -370,6 +371,47 @@ mod tests {
             .expired_hotkey_transcription_failure_audio(Utc::now(), 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_media_cleanup_skips_audio_with_active_retry_claim() {
+        let dir = temp_dir("failed-hotkey-audio-claim-skip");
+        let db = temp_db(&dir);
+        let audio_path = dir.join("media/recordings/kloyce-claimed-test.mp3");
+        let audio_path_str = audio_path.to_string_lossy().to_string();
+        std::fs::create_dir_all(audio_path.parent().unwrap()).unwrap();
+        std::fs::write(&audio_path, b"audio").unwrap();
+        let failure = db
+            .insert_hotkey_transcription_failure(
+                "20260811-121000.000000",
+                10,
+                &[],
+                None,
+                false,
+                "whisper-cli exited with status 1",
+                Some(audio_path_str.as_str()),
+                Some("kloyce-claimed-test.mp3"),
+                Some(Utc::now() - Duration::minutes(1)),
+                None,
+            )
+            .unwrap();
+        assert!(db
+            .claim_hotkey_transcription_failure_retry(failure.id)
+            .unwrap());
+
+        let storage = MediaStorage::new(dir, PathBuf::from("ffmpeg"), PathBuf::from("ffprobe"));
+        cleanup_terminal_job_media(&db, &storage, Utc::now())
+            .await
+            .unwrap();
+
+        // An in-flight retry holds the claim, so cleanup must leave the
+        // audio (and the row's audio_cleaned_at) untouched.
+        assert!(audio_path.exists());
+        let untouched = db
+            .get_hotkey_transcription_failure(failure.id)
+            .unwrap()
+            .unwrap();
+        assert!(untouched.audio_cleaned_at.is_none());
     }
 }
 
@@ -1313,11 +1355,14 @@ fn short_job_error(error_message: &str) -> String {
     shortened
 }
 
-/// Kick off a background task that waits `HOTKEY_FAILURE_RETRY_DELAY_SECS`
-/// and then retries a failed hotkey transcription from its retained audio.
+/// Kick off a background task that waits `delay_secs` (0 to run
+/// immediately, e.g. for startup rescheduling) and then attempts a
+/// claim-gated retry of a failed hotkey transcription from its retained
+/// audio.
 #[allow(clippy::too_many_arguments)]
 fn schedule_hotkey_transcription_retry(
     failure_id: i64,
+    delay_secs: u64,
     config: Arc<RwLock<Config>>,
     database: Arc<db::Db>,
     dictionary: Arc<RwLock<Dictionary>>,
@@ -1328,11 +1373,10 @@ fn schedule_hotkey_transcription_retry(
     data_dir: PathBuf,
 ) {
     tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_secs(
-            HOTKEY_FAILURE_RETRY_DELAY_SECS,
-        ))
-        .await;
-        retry_hotkey_transcription(
+        if delay_secs > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+        }
+        claim_and_retry_hotkey_transcription(
             failure_id,
             config,
             database,
@@ -1347,9 +1391,99 @@ fn schedule_hotkey_transcription_retry(
     });
 }
 
+/// Attempt the atomic retry claim before doing any work, then run the
+/// retry if it succeeded. This is the single entry point the automatic
+/// retry (post-delay and startup rescan) goes through; `kloyce-ctl retry`
+/// claims directly (via `Db::claim_hotkey_transcription_failure_retry`) so
+/// it can surface a "retry already in progress" error to the caller
+/// instead of only logging it.
+#[allow(clippy::too_many_arguments)]
+async fn claim_and_retry_hotkey_transcription(
+    failure_id: i64,
+    config: Arc<RwLock<Config>>,
+    database: Arc<db::Db>,
+    dictionary: Arc<RwLock<Dictionary>>,
+    event_tx: broadcast::Sender<web::SseEvent>,
+    metrics: Arc<RwLock<Metrics>>,
+    history: Arc<Mutex<VecDeque<TranscriptionEntry>>>,
+    history_size: usize,
+    data_dir: PathBuf,
+) {
+    let db_handle = database.clone();
+    let claimed = tokio::task::spawn_blocking(move || {
+        db_handle.claim_hotkey_transcription_failure_retry(failure_id)
+    })
+    .await;
+    match claimed {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => {
+            tracing::info!(
+                failure_id,
+                "Hotkey transcription retry already in progress or resolved; skipping"
+            );
+            return;
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                failure_id,
+                "Failed to claim hotkey transcription retry: {error}"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::error!(
+                failure_id,
+                "Claim task for hotkey transcription retry crashed: {error}"
+            );
+            return;
+        }
+    }
+    retry_hotkey_transcription(
+        failure_id,
+        config,
+        database,
+        dictionary,
+        event_tx,
+        metrics,
+        history,
+        history_size,
+        data_dir,
+    )
+    .await;
+}
+
+/// Release a retry claim without recording an error, logging failures
+/// rather than propagating them since callers use this from bail-out
+/// paths that are already reporting their own outcome.
+async fn release_hotkey_transcription_failure_retry_claim(database: &Arc<db::Db>, failure_id: i64) {
+    let db_handle = database.clone();
+    match tokio::task::spawn_blocking(move || {
+        db_handle.release_hotkey_transcription_failure_retry_claim(failure_id)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::error!(
+                failure_id,
+                "Failed to release hotkey transcription retry claim: {error}"
+            )
+        }
+        Err(error) => {
+            tracing::error!(
+                failure_id,
+                "Release-claim task for hotkey transcription retry crashed: {error}"
+            )
+        }
+    }
+}
+
 /// Reprocess a failed hotkey transcription from its retained audio through
 /// the same transcribe + pipeline + output path used for a live recording.
-/// Used both by the automatic 30s retry and by `kloyce-ctl retry`.
+/// Used both by the automatic 30s retry and by `kloyce-ctl retry`. Callers
+/// MUST hold the retry claim (`Db::claim_hotkey_transcription_failure_retry`)
+/// before calling this; every non-success exit path releases it so a later
+/// retry can proceed.
 #[allow(clippy::too_many_arguments)]
 async fn retry_hotkey_transcription(
     failure_id: i64,
@@ -1381,10 +1515,12 @@ async fn retry_hotkey_transcription(
                 failure_id,
                 "Failed to load failed hotkey transcription for retry: {error}"
             );
+            release_hotkey_transcription_failure_retry_claim(&database, failure_id).await;
             return;
         }
         Err(error) => {
             tracing::error!(failure_id, "Retry lookup task crashed: {error}");
+            release_hotkey_transcription_failure_retry_claim(&database, failure_id).await;
             return;
         }
     };
@@ -1394,23 +1530,31 @@ async fn retry_hotkey_transcription(
             failure_id,
             "Failed hotkey transcription already resolved; skipping retry"
         );
+        release_hotkey_transcription_failure_retry_claim(&database, failure_id).await;
         return;
     }
 
-    let Some(audio_path) = failure.audio_path.clone() else {
+    if !failure.has_retained_audio() {
         tracing::warn!(
             failure_id,
             "No retained audio for failed hotkey transcription; skipping retry"
         );
+        release_hotkey_transcription_failure_retry_claim(&database, failure_id).await;
         return;
-    };
-    let audio_path = PathBuf::from(audio_path);
+    }
+    let audio_path = PathBuf::from(
+        failure
+            .audio_path
+            .clone()
+            .expect("checked by has_retained_audio"),
+    );
     if !audio_path.exists() {
         tracing::warn!(
             failure_id,
             audio_path = %audio_path.display(),
             "Retained audio missing; skipping retry"
         );
+        release_hotkey_transcription_failure_retry_claim(&database, failure_id).await;
         return;
     }
 
@@ -1745,6 +1889,15 @@ impl Daemon {
                 "Marked interrupted transcription jobs failed on daemon startup"
             );
         }
+        let recovered_retry_claims = self
+            .database
+            .recover_interrupted_hotkey_transcription_retries()?;
+        if recovered_retry_claims > 0 {
+            tracing::warn!(
+                recovered_retry_claims,
+                "Released hotkey transcription retry claims left by a crashed daemon on startup"
+            );
+        }
         startup_media_storage.delete_all_working_audio().await;
 
         // Load persisted metrics
@@ -1819,6 +1972,36 @@ impl Daemon {
             self.database.clone(),
             self.data_dir.clone(),
         ));
+
+        // Reschedule persisted auto-retries lost to a daemon restart (the
+        // in-memory 30s timer doesn't survive a crash/restart, whether the
+        // restart happens before or during the 30s delay); goes through
+        // the same claim-gated path as the normal auto retry so delivery
+        // stays at-most-once even if this races a manual retry.
+        let now = Utc::now();
+        let pending_retries = self.database.pending_hotkey_transcription_auto_retries()?;
+        if !pending_retries.is_empty() {
+            tracing::info!(
+                count = pending_retries.len(),
+                "Rescheduling hotkey transcription retries pending from before a daemon restart"
+            );
+        }
+        for failure in pending_retries {
+            let due_at = failure.auto_retry_due_at.unwrap_or(now);
+            let delay_secs = (due_at - now).num_seconds().max(0) as u64;
+            schedule_hotkey_transcription_retry(
+                failure.id,
+                delay_secs,
+                self.config.clone(),
+                self.database.clone(),
+                self.dictionary.clone(),
+                self.event_tx.clone(),
+                self.metrics.clone(),
+                self.history.clone(),
+                startup_config.history_size,
+                self.data_dir.clone(),
+            );
+        }
 
         tracing::info!("Kloyce daemon running");
 
@@ -2380,6 +2563,10 @@ impl Daemon {
                                     .map(|metadata| metadata.filename.clone());
                                 let audio_expires_at_for_db =
                                     retained_audio.as_ref().map(|metadata| metadata.expires_at);
+                                let auto_retry_due_at_for_db = has_audio.then(|| {
+                                    Utc::now()
+                                        + Duration::seconds(HOTKEY_FAILURE_RETRY_DELAY_SECS as i64)
+                                });
                                 let failure_record = tokio::task::spawn_blocking(move || {
                                     db_handle.insert_hotkey_transcription_failure(
                                         &recording_id_for_db,
@@ -2391,6 +2578,7 @@ impl Daemon {
                                         audio_path_for_db.as_deref(),
                                         audio_filename_for_db.as_deref(),
                                         audio_expires_at_for_db,
+                                        auto_retry_due_at_for_db,
                                     )
                                 })
                                 .await;
@@ -2407,6 +2595,7 @@ impl Daemon {
                                         if has_audio {
                                             schedule_hotkey_transcription_retry(
                                                 failure.id,
+                                                HOTKEY_FAILURE_RETRY_DELAY_SECS,
                                                 config_arc.clone(),
                                                 database.clone(),
                                                 dictionary.clone(),
@@ -2551,7 +2740,7 @@ impl Daemon {
                     failure.id,
                     format_failed_transcription_age(now - failure.created_at),
                     failure.retry_count,
-                    if failure.audio_path.is_some() {
+                    if failure.has_retained_audio() {
                         "yes"
                     } else {
                         "no"
@@ -2624,7 +2813,7 @@ impl Daemon {
                 ),
             };
         }
-        if failure.audio_path.is_none() {
+        if !failure.has_retained_audio() {
             return Response {
                 status: "error",
                 state: current_state,
@@ -2636,6 +2825,40 @@ impl Daemon {
         }
 
         let failure_id = failure.id;
+        let db_handle = database.clone();
+        let claimed = tokio::task::spawn_blocking(move || {
+            db_handle.claim_hotkey_transcription_failure_retry(failure_id)
+        })
+        .await;
+        let claimed = match claimed {
+            Ok(Ok(claimed)) => claimed,
+            Ok(Err(error)) => {
+                return Response {
+                    status: "error",
+                    state: current_state,
+                    message: format!("Failed to claim retry for failed hotkey transcription {failure_id}: {error}"),
+                };
+            }
+            Err(error) => {
+                return Response {
+                    status: "error",
+                    state: current_state,
+                    message: format!(
+                        "Claim task for failed hotkey transcription {failure_id} crashed: {error}"
+                    ),
+                };
+            }
+        };
+        if !claimed {
+            return Response {
+                status: "error",
+                state: current_state,
+                message: format!(
+                    "Retry already in progress for failed hotkey transcription {failure_id}"
+                ),
+            };
+        }
+
         let history_size = self.config.read().await.history_size;
         tokio::spawn(retry_hotkey_transcription(
             failure_id,

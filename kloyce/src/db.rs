@@ -16,6 +16,11 @@ pub struct Db {
 
 pub const DEFAULT_SOURCE_MEDIA_RETENTION_DAYS: i64 = 7;
 
+/// A retry claim (`retry_started_at`) older than this is treated as
+/// abandoned by a crashed retry, so its audio is eligible for cleanup and
+/// the failure can be claimed again.
+const STALE_RETRY_CLAIM_MINUTES: i64 = 10;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpiredTranscriptionAudio {
     pub id: i64,
@@ -39,6 +44,20 @@ pub struct HotkeyTranscriptionFailure {
     pub audio_cleaned_at: Option<DateTime<Utc>>,
     pub retry_count: i64,
     pub resolved_at: Option<DateTime<Utc>>,
+    /// Set while an automatic or manual retry attempt owns this failure;
+    /// acts as an atomic claim gating concurrent retries and cleanup.
+    pub retry_started_at: Option<DateTime<Utc>>,
+    /// When set (and no retry is in flight), the automatic 30s retry is
+    /// still owed and should be re-scheduled, e.g. after a daemon restart.
+    pub auto_retry_due_at: Option<DateTime<Utc>>,
+}
+
+impl HotkeyTranscriptionFailure {
+    /// Whether retained audio still exists for this failure: the audio was
+    /// stored and has not since been cleaned up by the retention worker.
+    pub fn has_retained_audio(&self) -> bool {
+        self.audio_path.is_some() && self.audio_cleaned_at.is_none()
+    }
 }
 
 impl Db {
@@ -143,11 +162,24 @@ impl Db {
                 audio_expires_at TEXT,
                 audio_cleaned_at TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,
-                resolved_at TEXT
+                resolved_at TEXT,
+                retry_started_at TEXT,
+                auto_retry_due_at TEXT
             );
             CREATE INDEX IF NOT EXISTS hotkey_transcription_failures_unresolved_idx
                 ON hotkey_transcription_failures (resolved_at, created_at);",
         )?;
+
+        // Migration: add retry-claim and auto-retry-scheduling columns for
+        // databases created before the atomic retry claim existed.
+        conn.execute_batch(
+            "ALTER TABLE hotkey_transcription_failures ADD COLUMN retry_started_at TEXT;",
+        )
+        .ok();
+        conn.execute_batch(
+            "ALTER TABLE hotkey_transcription_failures ADD COLUMN auto_retry_due_at TEXT;",
+        )
+        .ok();
 
         tracing::info!("Opened database at {}", path.display());
         Ok(Self {
@@ -766,11 +798,13 @@ impl Db {
         audio_path: Option<&str>,
         audio_filename: Option<&str>,
         audio_expires_at: Option<DateTime<Utc>>,
+        auto_retry_due_at: Option<DateTime<Utc>>,
     ) -> Result<HotkeyTranscriptionFailure, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         let tags_json = serde_json::to_string(context_tags).unwrap_or_else(|_| "[]".into());
         let audio_expires_at = audio_expires_at.map(|dt| dt.to_rfc3339());
+        let auto_retry_due_at = auto_retry_due_at.map(|dt| dt.to_rfc3339());
         conn.execute(
             "INSERT INTO hotkey_transcription_failures (
                 created_at,
@@ -783,8 +817,9 @@ impl Db {
                 error_message,
                 audio_path,
                 audio_filename,
-                audio_expires_at
-            ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                audio_expires_at,
+                auto_retry_due_at
+            ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 now,
                 recording_id,
@@ -796,6 +831,7 @@ impl Db {
                 audio_path,
                 audio_filename,
                 audio_expires_at,
+                auto_retry_due_at,
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -855,6 +891,96 @@ impl Db {
             .optional()
     }
 
+    /// Atomically claim the right to retry a failed hotkey transcription.
+    /// Succeeds (returns `true`) only if the failure is unresolved and no
+    /// other *active* retry currently holds the claim; this is the single
+    /// check-and-set that both the automatic 30s retry and `kloyce-ctl
+    /// retry` must go through, so at most one retry ever runs per failure.
+    /// A claim older than `STALE_RETRY_CLAIM_MINUTES` is treated as
+    /// abandoned (e.g. a task panic that didn't take the whole daemon
+    /// down) and can be stolen, so a crashed retry never permanently
+    /// blocks future retries. Also consumes any pending automatic-retry
+    /// schedule, since claiming counts as the retry attempt being made.
+    pub fn claim_hotkey_transcription_failure_retry(
+        &self,
+        id: i64,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let stale_claim_cutoff = (now - Duration::minutes(STALE_RETRY_CLAIM_MINUTES)).to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE hotkey_transcription_failures
+             SET retry_started_at = ?1, auto_retry_due_at = NULL, updated_at = ?1
+             WHERE id = ?2
+               AND resolved_at IS NULL
+               AND (retry_started_at IS NULL OR retry_started_at <= ?3)",
+            rusqlite::params![now_str, id, stale_claim_cutoff],
+        )?;
+        Ok(rows == 1)
+    }
+
+    /// Release a retry claim without recording an error or resolving the
+    /// failure, so a later retry (automatic rescan or manual) can proceed.
+    /// Used for bail-out paths that never reach the transcribe attempt.
+    pub fn release_hotkey_transcription_failure_retry_claim(
+        &self,
+        id: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE hotkey_transcription_failures
+             SET retry_started_at = NULL
+             WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Release every retry claim on daemon startup. A freshly-started
+    /// process can never legitimately hold a claim left over from before
+    /// it started, so any such claim belongs to a crashed or killed prior
+    /// process; mirrors `recover_interrupted_active_jobs`'s startup
+    /// recovery for transcription jobs. Returns the number released.
+    pub fn recover_interrupted_hotkey_transcription_retries(
+        &self,
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn.execute(
+            "UPDATE hotkey_transcription_failures
+             SET retry_started_at = NULL
+             WHERE resolved_at IS NULL AND retry_started_at IS NOT NULL",
+            [],
+        )?;
+        Ok(rows)
+    }
+
+    /// Unresolved, unclaimed failures with a pending automatic retry,
+    /// whether or not it's due yet. Daemon startup uses this (rather than
+    /// filtering to already-due rows) so a restart mid-delay still
+    /// reschedules the retry, just with its remaining delay instead of
+    /// losing it outright. Callers must still go through
+    /// `claim_hotkey_transcription_failure_retry` before retrying so
+    /// delivery stays at-most-once.
+    pub fn pending_hotkey_transcription_auto_retries(
+        &self,
+    ) -> Result<Vec<HotkeyTranscriptionFailure>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {HOTKEY_FAILURE_SELECT_COLUMNS}
+             FROM hotkey_transcription_failures
+             WHERE resolved_at IS NULL
+               AND retry_started_at IS NULL
+               AND auto_retry_due_at IS NOT NULL
+             ORDER BY auto_retry_due_at ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], row_to_hotkey_transcription_failure)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn mark_hotkey_transcription_failure_resolved(
         &self,
         id: i64,
@@ -863,13 +989,17 @@ impl Db {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE hotkey_transcription_failures
-             SET resolved_at = COALESCE(resolved_at, ?1), updated_at = ?1
+             SET resolved_at = COALESCE(resolved_at, ?1),
+                 retry_started_at = NULL,
+                 updated_at = ?1
              WHERE id = ?2",
             rusqlite::params![now, id],
         )?;
         Ok(())
     }
 
+    /// Record a failed retry attempt and release its claim, so a later
+    /// automatic rescan or manual `kloyce-ctl retry` can try again.
     pub fn record_hotkey_transcription_failure_retry_error(
         &self,
         id: i64,
@@ -881,6 +1011,7 @@ impl Db {
             "UPDATE hotkey_transcription_failures
              SET retry_count = retry_count + 1,
                  error_message = ?1,
+                 retry_started_at = NULL,
                  updated_at = ?2
              WHERE id = ?3",
             rusqlite::params![error_message, now, id],
@@ -888,12 +1019,18 @@ impl Db {
         get_hotkey_transcription_failure_on(&conn, id)
     }
 
+    /// Audio retained for a failed hotkey transcription past its expiry.
+    /// Excludes rows with an active retry claim so cleanup never deletes
+    /// audio out from under an in-flight retry; a claim older than
+    /// `STALE_RETRY_CLAIM_MINUTES` is treated as abandoned (e.g. a crashed
+    /// retry) and its audio becomes eligible for cleanup again.
     pub fn expired_hotkey_transcription_failure_audio(
         &self,
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<ExpiredTranscriptionAudio>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
+        let stale_claim_cutoff = (now - Duration::minutes(STALE_RETRY_CLAIM_MINUTES)).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT id, audio_path
              FROM hotkey_transcription_failures
@@ -902,16 +1039,23 @@ impl Db {
                AND audio_expires_at IS NOT NULL
                AND audio_cleaned_at IS NULL
                AND audio_expires_at <= ?1
+               AND (
+                 retry_started_at IS NULL
+                 OR retry_started_at <= ?3
+               )
              ORDER BY audio_expires_at ASC, id ASC
              LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![now.to_rfc3339(), limit as i64], |row| {
-                Ok(ExpiredTranscriptionAudio {
-                    id: row.get(0)?,
-                    audio_path: row.get(1)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![now.to_rfc3339(), limit as i64, stale_claim_cutoff],
+                |row| {
+                    Ok(ExpiredTranscriptionAudio {
+                        id: row.get(0)?,
+                        audio_path: row.get(1)?,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -959,7 +1103,7 @@ const TRANSCRIPTION_SELECT_COLUMNS: &str = "timestamp, duration_secs, word_count
 
 const JOB_SELECT_COLUMNS: &str = "id, created_at, updated_at, source_media_path, source_filename, working_audio_path, status, mode, settings_json, result_json, error_message, progress_pct, cancel_requested, started_at, completed_at, source_media_retain_until";
 
-const HOTKEY_FAILURE_SELECT_COLUMNS: &str = "id, created_at, updated_at, recording_id, duration_secs, context_tags, tmux_target, auto_enter, error_message, audio_path, audio_filename, audio_expires_at, audio_cleaned_at, retry_count, resolved_at";
+const HOTKEY_FAILURE_SELECT_COLUMNS: &str = "id, created_at, updated_at, recording_id, duration_secs, context_tags, tmux_target, auto_enter, error_message, audio_path, audio_filename, audio_expires_at, audio_cleaned_at, retry_count, resolved_at, retry_started_at, auto_retry_due_at";
 
 mod hotkey_failure_column {
     pub const ID: usize = 0;
@@ -977,6 +1121,8 @@ mod hotkey_failure_column {
     pub const AUDIO_CLEANED_AT: usize = 12;
     pub const RETRY_COUNT: usize = 13;
     pub const RESOLVED_AT: usize = 14;
+    pub const RETRY_STARTED_AT: usize = 15;
+    pub const AUTO_RETRY_DUE_AT: usize = 16;
 }
 
 fn get_hotkey_transcription_failure_on(
@@ -1014,6 +1160,8 @@ fn row_to_hotkey_transcription_failure(
         audio_cleaned_at: parse_optional_datetime(row, hotkey_failure_column::AUDIO_CLEANED_AT)?,
         retry_count: row.get(hotkey_failure_column::RETRY_COUNT)?,
         resolved_at: parse_optional_datetime(row, hotkey_failure_column::RESOLVED_AT)?,
+        retry_started_at: parse_optional_datetime(row, hotkey_failure_column::RETRY_STARTED_AT)?,
+        auto_retry_due_at: parse_optional_datetime(row, hotkey_failure_column::AUTO_RETRY_DUE_AT)?,
     })
 }
 
@@ -1443,6 +1591,7 @@ mod tests {
                 Some("/tmp/kloyce-failed.mp3"),
                 Some("kloyce-failed.mp3"),
                 Some(expires),
+                None,
             )
             .unwrap();
 
@@ -1504,6 +1653,7 @@ mod tests {
                 Some("/tmp/expired-failure.mp3"),
                 Some("expired-failure.mp3"),
                 Some(now - Duration::minutes(1)),
+                None,
             )
             .unwrap();
         db.insert_hotkey_transcription_failure(
@@ -1516,6 +1666,7 @@ mod tests {
             Some("/tmp/fresh-failure.mp3"),
             Some("fresh-failure.mp3"),
             Some(now + Duration::hours(24)),
+            None,
         )
         .unwrap();
 
@@ -1537,5 +1688,344 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(cleaned.audio_cleaned_at.is_some());
+    }
+
+    #[test]
+    fn hotkey_transcription_failure_retry_claim_is_atomic_and_releases_on_failure() {
+        let db = temp_db();
+        let expires = Utc::now() + Duration::hours(24);
+        let failure = db
+            .insert_hotkey_transcription_failure(
+                "20260811-091000.000000",
+                9,
+                &[],
+                None,
+                false,
+                "transcription failed",
+                Some("/tmp/claim-test.mp3"),
+                Some("claim-test.mp3"),
+                Some(expires),
+                None,
+            )
+            .unwrap();
+
+        // First claim succeeds; a second concurrent claim (auto task or a
+        // second `kloyce-ctl retry`) must lose the race, not double-run.
+        assert!(db
+            .claim_hotkey_transcription_failure_retry(failure.id)
+            .unwrap());
+        assert!(!db
+            .claim_hotkey_transcription_failure_retry(failure.id)
+            .unwrap());
+
+        let claimed = db
+            .get_hotkey_transcription_failure(failure.id)
+            .unwrap()
+            .unwrap();
+        assert!(claimed.retry_started_at.is_some());
+
+        // A failed retry releases the claim so a later retry can proceed.
+        db.record_hotkey_transcription_failure_retry_error(failure.id, "still failing")
+            .unwrap();
+        let released = db
+            .get_hotkey_transcription_failure(failure.id)
+            .unwrap()
+            .unwrap();
+        assert!(released.retry_started_at.is_none());
+        assert!(db
+            .claim_hotkey_transcription_failure_retry(failure.id)
+            .unwrap());
+
+        // A successful retry resolves the failure and releases the claim in
+        // the same update.
+        db.mark_hotkey_transcription_failure_resolved(failure.id)
+            .unwrap();
+        let resolved = db
+            .get_hotkey_transcription_failure(failure.id)
+            .unwrap()
+            .unwrap();
+        assert!(resolved.resolved_at.is_some());
+        assert!(resolved.retry_started_at.is_none());
+
+        // A resolved failure can never be claimed again.
+        assert!(!db
+            .claim_hotkey_transcription_failure_retry(failure.id)
+            .unwrap());
+    }
+
+    #[test]
+    fn expired_hotkey_transcription_failure_audio_skips_active_claim_but_includes_stale_claim() {
+        let db = temp_db();
+        let now = Utc::now();
+
+        let actively_claimed = db
+            .insert_hotkey_transcription_failure(
+                "20260811-092000.000000",
+                8,
+                &[],
+                None,
+                false,
+                "transcription failed",
+                Some("/tmp/active-claim.mp3"),
+                Some("active-claim.mp3"),
+                Some(now - Duration::minutes(1)),
+                None,
+            )
+            .unwrap();
+        let stale_claimed = db
+            .insert_hotkey_transcription_failure(
+                "20260811-092100.000000",
+                8,
+                &[],
+                None,
+                false,
+                "transcription failed",
+                Some("/tmp/stale-claim.mp3"),
+                Some("stale-claim.mp3"),
+                Some(now - Duration::minutes(1)),
+                None,
+            )
+            .unwrap();
+        let unclaimed = db
+            .insert_hotkey_transcription_failure(
+                "20260811-092200.000000",
+                8,
+                &[],
+                None,
+                false,
+                "transcription failed",
+                Some("/tmp/unclaimed.mp3"),
+                Some("unclaimed.mp3"),
+                Some(now - Duration::minutes(1)),
+                None,
+            )
+            .unwrap();
+
+        assert!(db
+            .claim_hotkey_transcription_failure_retry(actively_claimed.id)
+            .unwrap());
+        assert!(db
+            .claim_hotkey_transcription_failure_retry(stale_claimed.id)
+            .unwrap());
+        // Simulate a crashed retry: back-date the claim past the staleness
+        // threshold so cleanup no longer treats it as active.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE hotkey_transcription_failures SET retry_started_at = ?1 WHERE id = ?2",
+                rusqlite::params![(now - Duration::minutes(11)).to_rfc3339(), stale_claimed.id],
+            )
+            .unwrap();
+
+        let candidates = db
+            .expired_hotkey_transcription_failure_audio(now, 10)
+            .unwrap();
+        let candidate_ids: Vec<i64> = candidates.iter().map(|c| c.id).collect();
+
+        assert!(!candidate_ids.contains(&actively_claimed.id));
+        assert!(candidate_ids.contains(&stale_claimed.id));
+        assert!(candidate_ids.contains(&unclaimed.id));
+    }
+
+    #[test]
+    fn pending_hotkey_transcription_auto_retries_includes_not_yet_due_rows_for_restart_mid_delay() {
+        let db = temp_db();
+        let now = Utc::now();
+
+        // Overdue: e.g. the daemon was down past the scheduled retry time.
+        let overdue = db
+            .insert_hotkey_transcription_failure(
+                "20260811-093000.000000",
+                8,
+                &[],
+                None,
+                false,
+                "transcription failed",
+                Some("/tmp/overdue.mp3"),
+                Some("overdue.mp3"),
+                Some(now + Duration::hours(24)),
+                Some(now - Duration::seconds(5)),
+            )
+            .unwrap();
+        // Not yet due: the daemon restarted mid-delay (e.g. 10s into the
+        // 30s wait). This must still be picked up so the retry isn't lost,
+        // just rescheduled with its remaining delay.
+        let not_yet_due = db
+            .insert_hotkey_transcription_failure(
+                "20260811-093100.000000",
+                8,
+                &[],
+                None,
+                false,
+                "transcription failed",
+                Some("/tmp/not-yet-due.mp3"),
+                Some("not-yet-due.mp3"),
+                Some(now + Duration::hours(24)),
+                Some(now + Duration::seconds(20)),
+            )
+            .unwrap();
+
+        let pending = db.pending_hotkey_transcription_auto_retries().unwrap();
+        let pending_ids: Vec<i64> = pending.iter().map(|f| f.id).collect();
+        assert_eq!(pending_ids, vec![overdue.id, not_yet_due.id]);
+
+        // Startup rescheduling goes through the same claim gate: claiming
+        // a pending retry also consumes its schedule.
+        assert!(db
+            .claim_hotkey_transcription_failure_retry(overdue.id)
+            .unwrap());
+        let remaining = db.pending_hotkey_transcription_auto_retries().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, not_yet_due.id);
+        let claimed = db
+            .get_hotkey_transcription_failure(overdue.id)
+            .unwrap()
+            .unwrap();
+        assert!(claimed.auto_retry_due_at.is_none());
+    }
+
+    #[test]
+    fn claim_can_steal_a_stale_abandoned_retry_claim() {
+        let db = temp_db();
+        let expires = Utc::now() + Duration::hours(24);
+        let failure = db
+            .insert_hotkey_transcription_failure(
+                "20260811-094500.000000",
+                9,
+                &[],
+                None,
+                false,
+                "transcription failed",
+                Some("/tmp/stale-steal.mp3"),
+                Some("stale-steal.mp3"),
+                Some(expires),
+                None,
+            )
+            .unwrap();
+
+        assert!(db
+            .claim_hotkey_transcription_failure_retry(failure.id)
+            .unwrap());
+        // A fresh claim cannot be stolen.
+        assert!(!db
+            .claim_hotkey_transcription_failure_retry(failure.id)
+            .unwrap());
+
+        // Simulate a crashed retry task (not a full daemon restart): the
+        // claim goes stale without anything ever releasing it.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE hotkey_transcription_failures SET retry_started_at = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    (Utc::now() - Duration::minutes(11)).to_rfc3339(),
+                    failure.id
+                ],
+            )
+            .unwrap();
+
+        // A later claim attempt steals the abandoned claim instead of
+        // being permanently blocked.
+        assert!(db
+            .claim_hotkey_transcription_failure_retry(failure.id)
+            .unwrap());
+    }
+
+    #[test]
+    fn startup_recovery_releases_every_interrupted_retry_claim() {
+        let db = temp_db();
+        let expires = Utc::now() + Duration::hours(24);
+        let claimed = db
+            .insert_hotkey_transcription_failure(
+                "20260811-095000.000000",
+                9,
+                &[],
+                None,
+                false,
+                "transcription failed",
+                Some("/tmp/interrupted.mp3"),
+                Some("interrupted.mp3"),
+                Some(expires),
+                None,
+            )
+            .unwrap();
+        let unclaimed = db
+            .insert_hotkey_transcription_failure(
+                "20260811-095100.000000",
+                9,
+                &[],
+                None,
+                false,
+                "transcription failed",
+                Some("/tmp/untouched.mp3"),
+                Some("untouched.mp3"),
+                Some(expires),
+                None,
+            )
+            .unwrap();
+        assert!(db
+            .claim_hotkey_transcription_failure_retry(claimed.id)
+            .unwrap());
+
+        // A freshly-started process recovers every claim left behind by
+        // the crashed prior process, even a claim that isn't stale yet.
+        let released = db
+            .recover_interrupted_hotkey_transcription_retries()
+            .unwrap();
+        assert_eq!(released, 1);
+
+        let recovered = db
+            .get_hotkey_transcription_failure(claimed.id)
+            .unwrap()
+            .unwrap();
+        assert!(recovered.retry_started_at.is_none());
+        assert!(db
+            .claim_hotkey_transcription_failure_retry(claimed.id)
+            .unwrap());
+
+        let untouched = db
+            .get_hotkey_transcription_failure(unclaimed.id)
+            .unwrap()
+            .unwrap();
+        assert!(untouched.retry_started_at.is_none());
+    }
+
+    #[test]
+    fn hotkey_transcription_failure_has_retained_audio_reflects_path_and_cleanup() {
+        let base = HotkeyTranscriptionFailure {
+            id: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            recording_id: "20260811-094000.000000".to_string(),
+            duration_secs: 5,
+            context_tags: vec![],
+            tmux_target: None,
+            auto_enter: false,
+            error_message: "boom".to_string(),
+            audio_path: None,
+            audio_filename: None,
+            audio_expires_at: None,
+            audio_cleaned_at: None,
+            retry_count: 0,
+            resolved_at: None,
+            retry_started_at: None,
+            auto_retry_due_at: None,
+        };
+
+        assert!(!base.has_retained_audio());
+
+        let with_audio = HotkeyTranscriptionFailure {
+            audio_path: Some("/tmp/kloyce-failed.mp3".to_string()),
+            ..base.clone()
+        };
+        assert!(with_audio.has_retained_audio());
+
+        let cleaned = HotkeyTranscriptionFailure {
+            audio_cleaned_at: Some(Utc::now()),
+            ..with_audio
+        };
+        assert!(!cleaned.has_retained_audio());
     }
 }
