@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
-pub const DEFAULT_HOTKEY_AUDIO_RETENTION_DAYS: i64 = 7;
-pub const MAX_HOTKEY_AUDIO_RETENTION_DAYS: i64 = 3650;
+pub const DEFAULT_HOTKEY_AUDIO_RETENTION_HOURS: u64 = 24;
+pub const MAX_HOTKEY_AUDIO_RETENTION_HOURS: u64 = 3650 * 24;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
@@ -113,11 +113,12 @@ pub struct Config {
     pub tmux_auto_enter: bool,
     pub tmux_voice_tag: bool,
     pub tmux_voice_tag_text: String,
+    pub clipboard_voice_tag: bool,
     pub advanced_transcription: AdvancedTranscription,
     pub transcription_defaults: TranscriptionDefaults,
     pub source_media_retention_days: i64,
     pub hotkey_audio_retention_enabled: bool,
-    pub hotkey_audio_retention_days: i64,
+    pub hotkey_audio_retention_hours: u64,
     pub whisper_flash_attn: bool,
     pub whisper_threads: u32,
     pub whisper_beam_size: u32,
@@ -157,11 +158,12 @@ impl Default for Config {
                 tmux_voice_tag: true,
                 tmux_voice_tag_text:
                     "[voice transcript - if anything is unclear, ask for clarification]".into(),
+                clipboard_voice_tag: true,
                 advanced_transcription: AdvancedTranscription::default(),
                 transcription_defaults: TranscriptionDefaults::default(),
                 source_media_retention_days: crate::db::DEFAULT_SOURCE_MEDIA_RETENTION_DAYS,
                 hotkey_audio_retention_enabled: true,
-                hotkey_audio_retention_days: DEFAULT_HOTKEY_AUDIO_RETENTION_DAYS,
+                hotkey_audio_retention_hours: DEFAULT_HOTKEY_AUDIO_RETENTION_HOURS,
                 whisper_flash_attn: true,
                 whisper_threads: 0,
                 whisper_beam_size: 0,
@@ -204,11 +206,12 @@ impl Default for Config {
                 tmux_voice_tag: true,
                 tmux_voice_tag_text:
                     "[voice transcript - if anything is unclear, ask for clarification]".into(),
+                clipboard_voice_tag: true,
                 advanced_transcription: AdvancedTranscription::default(),
                 transcription_defaults: TranscriptionDefaults::default(),
                 source_media_retention_days: crate::db::DEFAULT_SOURCE_MEDIA_RETENTION_DAYS,
                 hotkey_audio_retention_enabled: true,
-                hotkey_audio_retention_days: DEFAULT_HOTKEY_AUDIO_RETENTION_DAYS,
+                hotkey_audio_retention_hours: DEFAULT_HOTKEY_AUDIO_RETENTION_HOURS,
                 whisper_flash_attn: true,
                 whisper_threads: 0,
                 whisper_beam_size: 0,
@@ -258,11 +261,12 @@ impl Default for Config {
                 tmux_voice_tag: true,
                 tmux_voice_tag_text:
                     "[voice transcript - if anything is unclear, ask for clarification]".into(),
+                clipboard_voice_tag: true,
                 advanced_transcription: AdvancedTranscription::default(),
                 transcription_defaults: TranscriptionDefaults::default(),
                 source_media_retention_days: crate::db::DEFAULT_SOURCE_MEDIA_RETENTION_DAYS,
                 hotkey_audio_retention_enabled: true,
-                hotkey_audio_retention_days: DEFAULT_HOTKEY_AUDIO_RETENTION_DAYS,
+                hotkey_audio_retention_hours: DEFAULT_HOTKEY_AUDIO_RETENTION_HOURS,
                 whisper_flash_attn: true,
                 whisper_threads: 0,
                 whisper_beam_size: 0,
@@ -367,11 +371,11 @@ impl Config {
     pub fn apply_hotkey_audio_retention_update(
         &mut self,
         enabled: Option<bool>,
-        retention_days: Option<i64>,
+        retention_hours: Option<u64>,
     ) -> Result<(), ConfigValidationError> {
-        if let Some(days) = retention_days {
-            validate_hotkey_audio_retention_days(days)?;
-            self.hotkey_audio_retention_days = days;
+        if let Some(hours) = retention_hours {
+            validate_hotkey_audio_retention_hours(hours)?;
+            self.hotkey_audio_retention_hours = hours;
         }
         if let Some(enabled) = enabled {
             self.hotkey_audio_retention_enabled = enabled;
@@ -467,10 +471,10 @@ pub fn validate_transcription_defaults(
     Ok(())
 }
 
-pub fn validate_hotkey_audio_retention_days(days: i64) -> Result<(), ConfigValidationError> {
-    if !(0..=MAX_HOTKEY_AUDIO_RETENTION_DAYS).contains(&days) {
+pub fn validate_hotkey_audio_retention_hours(hours: u64) -> Result<(), ConfigValidationError> {
+    if hours > MAX_HOTKEY_AUDIO_RETENTION_HOURS {
         return Err(ConfigValidationError::new(format!(
-            "hotkey audio retention days must be between 0 and {MAX_HOTKEY_AUDIO_RETENTION_DAYS}"
+            "hotkey audio retention hours must be between 0 and {MAX_HOTKEY_AUDIO_RETENTION_HOURS}"
         )));
     }
     Ok(())
@@ -530,30 +534,30 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_audio_retention_defaults_to_enabled_for_seven_days() {
+    fn hotkey_audio_retention_defaults_to_enabled_for_twenty_four_hours() {
         let config = Config::default();
 
         assert!(config.hotkey_audio_retention_enabled);
         assert_eq!(
-            config.hotkey_audio_retention_days,
-            DEFAULT_HOTKEY_AUDIO_RETENTION_DAYS
+            config.hotkey_audio_retention_hours,
+            DEFAULT_HOTKEY_AUDIO_RETENTION_HOURS
         );
     }
 
     #[test]
-    fn hotkey_audio_retention_days_are_validated() {
+    fn hotkey_audio_retention_hours_are_validated() {
         let mut config = Config::default();
 
         config
             .apply_hotkey_audio_retention_update(Some(false), Some(0))
             .expect("zero means expire immediately");
         assert!(!config.hotkey_audio_retention_enabled);
-        assert_eq!(config.hotkey_audio_retention_days, 0);
+        assert_eq!(config.hotkey_audio_retention_hours, 0);
 
         let error = config
-            .apply_hotkey_audio_retention_update(None, Some(MAX_HOTKEY_AUDIO_RETENTION_DAYS + 1))
+            .apply_hotkey_audio_retention_update(None, Some(MAX_HOTKEY_AUDIO_RETENTION_HOURS + 1))
             .unwrap_err();
 
-        assert!(error.to_string().contains("hotkey audio retention days"));
+        assert!(error.to_string().contains("hotkey audio retention hours"));
     }
 }

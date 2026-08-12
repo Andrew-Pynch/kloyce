@@ -22,6 +22,25 @@ pub struct ExpiredTranscriptionAudio {
     pub audio_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyTranscriptionFailure {
+    pub id: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub recording_id: String,
+    pub duration_secs: u64,
+    pub context_tags: Vec<String>,
+    pub tmux_target: Option<String>,
+    pub auto_enter: bool,
+    pub error_message: String,
+    pub audio_path: Option<String>,
+    pub audio_filename: Option<String>,
+    pub audio_expires_at: Option<DateTime<Utc>>,
+    pub audio_cleaned_at: Option<DateTime<Utc>>,
+    pub retry_count: i64,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
 impl Db {
     pub fn open(path: PathBuf) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(parent) = path.parent() {
@@ -107,6 +126,28 @@ impl Db {
             "ALTER TABLE transcription_jobs ADD COLUMN source_media_cleaned_at TEXT;",
         )
         .ok();
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS hotkey_transcription_failures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                recording_id TEXT NOT NULL,
+                duration_secs INTEGER NOT NULL DEFAULT 0,
+                context_tags TEXT NOT NULL DEFAULT '[]',
+                tmux_target TEXT,
+                auto_enter INTEGER NOT NULL DEFAULT 0 CHECK (auto_enter IN (0, 1)),
+                error_message TEXT NOT NULL,
+                audio_path TEXT,
+                audio_filename TEXT,
+                audio_expires_at TEXT,
+                audio_cleaned_at TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                resolved_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS hotkey_transcription_failures_unresolved_idx
+                ON hotkey_transcription_failures (resolved_at, created_at);",
+        )?;
 
         tracing::info!("Opened database at {}", path.display());
         Ok(Self {
@@ -713,6 +754,183 @@ impl Db {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_hotkey_transcription_failure(
+        &self,
+        recording_id: &str,
+        duration_secs: u64,
+        context_tags: &[String],
+        tmux_target: Option<&str>,
+        auto_enter: bool,
+        error_message: &str,
+        audio_path: Option<&str>,
+        audio_filename: Option<&str>,
+        audio_expires_at: Option<DateTime<Utc>>,
+    ) -> Result<HotkeyTranscriptionFailure, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let tags_json = serde_json::to_string(context_tags).unwrap_or_else(|_| "[]".into());
+        let audio_expires_at = audio_expires_at.map(|dt| dt.to_rfc3339());
+        conn.execute(
+            "INSERT INTO hotkey_transcription_failures (
+                created_at,
+                updated_at,
+                recording_id,
+                duration_secs,
+                context_tags,
+                tmux_target,
+                auto_enter,
+                error_message,
+                audio_path,
+                audio_filename,
+                audio_expires_at
+            ) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                now,
+                recording_id,
+                duration_secs as i64,
+                tags_json,
+                tmux_target,
+                auto_enter,
+                error_message,
+                audio_path,
+                audio_filename,
+                audio_expires_at,
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        get_hotkey_transcription_failure_on(&conn, id)
+    }
+
+    pub fn get_hotkey_transcription_failure(
+        &self,
+        id: i64,
+    ) -> Result<Option<HotkeyTranscriptionFailure>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {HOTKEY_FAILURE_SELECT_COLUMNS} FROM hotkey_transcription_failures WHERE id = ?1"
+        );
+        conn.query_row(
+            &sql,
+            rusqlite::params![id],
+            row_to_hotkey_transcription_failure,
+        )
+        .optional()
+    }
+
+    pub fn unresolved_hotkey_transcription_failures(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<HotkeyTranscriptionFailure>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {HOTKEY_FAILURE_SELECT_COLUMNS}
+             FROM hotkey_transcription_failures
+             WHERE resolved_at IS NULL
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![limit as i64],
+                row_to_hotkey_transcription_failure,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn latest_unresolved_hotkey_transcription_failure(
+        &self,
+    ) -> Result<Option<HotkeyTranscriptionFailure>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let sql = format!(
+            "SELECT {HOTKEY_FAILURE_SELECT_COLUMNS}
+             FROM hotkey_transcription_failures
+             WHERE resolved_at IS NULL
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1"
+        );
+        conn.query_row(&sql, [], row_to_hotkey_transcription_failure)
+            .optional()
+    }
+
+    pub fn mark_hotkey_transcription_failure_resolved(
+        &self,
+        id: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE hotkey_transcription_failures
+             SET resolved_at = COALESCE(resolved_at, ?1), updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_hotkey_transcription_failure_retry_error(
+        &self,
+        id: i64,
+        error_message: &str,
+    ) -> Result<HotkeyTranscriptionFailure, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE hotkey_transcription_failures
+             SET retry_count = retry_count + 1,
+                 error_message = ?1,
+                 updated_at = ?2
+             WHERE id = ?3",
+            rusqlite::params![error_message, now, id],
+        )?;
+        get_hotkey_transcription_failure_on(&conn, id)
+    }
+
+    pub fn expired_hotkey_transcription_failure_audio(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<ExpiredTranscriptionAudio>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, audio_path
+             FROM hotkey_transcription_failures
+             WHERE audio_path IS NOT NULL
+               AND audio_path != ''
+               AND audio_expires_at IS NOT NULL
+               AND audio_cleaned_at IS NULL
+               AND audio_expires_at <= ?1
+             ORDER BY audio_expires_at ASC, id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![now.to_rfc3339(), limit as i64], |row| {
+                Ok(ExpiredTranscriptionAudio {
+                    id: row.get(0)?,
+                    audio_path: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn mark_hotkey_transcription_failure_audio_cleaned(
+        &self,
+        id: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE hotkey_transcription_failures
+             SET audio_cleaned_at = COALESCE(audio_cleaned_at, ?1)
+             WHERE id = ?2",
+            rusqlite::params![now, id],
+        )?;
+        Ok(())
+    }
+
     fn jobs_by_status(
         &self,
         statuses: &[JobStatus],
@@ -740,6 +958,64 @@ impl Db {
 const TRANSCRIPTION_SELECT_COLUMNS: &str = "timestamp, duration_secs, word_count, text, context_tags, recording_id, audio_path, audio_filename, audio_expires_at, audio_cleaned_at";
 
 const JOB_SELECT_COLUMNS: &str = "id, created_at, updated_at, source_media_path, source_filename, working_audio_path, status, mode, settings_json, result_json, error_message, progress_pct, cancel_requested, started_at, completed_at, source_media_retain_until";
+
+const HOTKEY_FAILURE_SELECT_COLUMNS: &str = "id, created_at, updated_at, recording_id, duration_secs, context_tags, tmux_target, auto_enter, error_message, audio_path, audio_filename, audio_expires_at, audio_cleaned_at, retry_count, resolved_at";
+
+mod hotkey_failure_column {
+    pub const ID: usize = 0;
+    pub const CREATED_AT: usize = 1;
+    pub const UPDATED_AT: usize = 2;
+    pub const RECORDING_ID: usize = 3;
+    pub const DURATION_SECS: usize = 4;
+    pub const CONTEXT_TAGS: usize = 5;
+    pub const TMUX_TARGET: usize = 6;
+    pub const AUTO_ENTER: usize = 7;
+    pub const ERROR_MESSAGE: usize = 8;
+    pub const AUDIO_PATH: usize = 9;
+    pub const AUDIO_FILENAME: usize = 10;
+    pub const AUDIO_EXPIRES_AT: usize = 11;
+    pub const AUDIO_CLEANED_AT: usize = 12;
+    pub const RETRY_COUNT: usize = 13;
+    pub const RESOLVED_AT: usize = 14;
+}
+
+fn get_hotkey_transcription_failure_on(
+    conn: &Connection,
+    id: i64,
+) -> Result<HotkeyTranscriptionFailure, rusqlite::Error> {
+    conn.query_row(
+        &format!("SELECT {HOTKEY_FAILURE_SELECT_COLUMNS} FROM hotkey_transcription_failures WHERE id = ?1"),
+        rusqlite::params![id],
+        row_to_hotkey_transcription_failure,
+    )
+}
+
+fn row_to_hotkey_transcription_failure(
+    row: &rusqlite::Row<'_>,
+) -> Result<HotkeyTranscriptionFailure, rusqlite::Error> {
+    let tags_str: String = row
+        .get::<_, String>(hotkey_failure_column::CONTEXT_TAGS)
+        .unwrap_or_else(|_| "[]".into());
+    let context_tags: Vec<String> = serde_json::from_str(&tags_str).unwrap_or_default();
+
+    Ok(HotkeyTranscriptionFailure {
+        id: row.get(hotkey_failure_column::ID)?,
+        created_at: parse_datetime(row, hotkey_failure_column::CREATED_AT)?,
+        updated_at: parse_datetime(row, hotkey_failure_column::UPDATED_AT)?,
+        recording_id: row.get(hotkey_failure_column::RECORDING_ID)?,
+        duration_secs: row.get::<_, i64>(hotkey_failure_column::DURATION_SECS)? as u64,
+        context_tags,
+        tmux_target: row.get(hotkey_failure_column::TMUX_TARGET)?,
+        auto_enter: row.get(hotkey_failure_column::AUTO_ENTER)?,
+        error_message: row.get(hotkey_failure_column::ERROR_MESSAGE)?,
+        audio_path: row.get(hotkey_failure_column::AUDIO_PATH)?,
+        audio_filename: row.get(hotkey_failure_column::AUDIO_FILENAME)?,
+        audio_expires_at: parse_optional_datetime(row, hotkey_failure_column::AUDIO_EXPIRES_AT)?,
+        audio_cleaned_at: parse_optional_datetime(row, hotkey_failure_column::AUDIO_CLEANED_AT)?,
+        retry_count: row.get(hotkey_failure_column::RETRY_COUNT)?,
+        resolved_at: parse_optional_datetime(row, hotkey_failure_column::RESOLVED_AT)?,
+    })
+}
 
 mod job_column {
     pub const ID: usize = 0;
@@ -1150,5 +1426,116 @@ mod tests {
 
         let candidates = db.expired_source_media_jobs(Utc::now(), 10).unwrap();
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn hotkey_transcription_failure_persists_and_lists_unresolved() {
+        let db = temp_db();
+        let expires = Utc::now() + Duration::hours(24);
+        let failure = db
+            .insert_hotkey_transcription_failure(
+                "20260811-090000.000000",
+                12,
+                &["test".to_string()],
+                Some("tmux-session:0.0"),
+                true,
+                "whisper-cli exited with status 1",
+                Some("/tmp/kloyce-failed.mp3"),
+                Some("kloyce-failed.mp3"),
+                Some(expires),
+            )
+            .unwrap();
+
+        assert_eq!(failure.retry_count, 0);
+        assert!(failure.resolved_at.is_none());
+        assert_eq!(
+            failure.audio_path.as_deref(),
+            Some("/tmp/kloyce-failed.mp3")
+        );
+        assert_eq!(failure.tmux_target.as_deref(), Some("tmux-session:0.0"));
+        assert!(failure.auto_enter);
+
+        let unresolved = db.unresolved_hotkey_transcription_failures(10).unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].id, failure.id);
+
+        let last = db
+            .latest_unresolved_hotkey_transcription_failure()
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.id, failure.id);
+
+        let retried = db
+            .record_hotkey_transcription_failure_retry_error(failure.id, "still failing")
+            .unwrap();
+        assert_eq!(retried.retry_count, 1);
+        assert_eq!(retried.error_message, "still failing");
+
+        db.mark_hotkey_transcription_failure_resolved(failure.id)
+            .unwrap();
+        assert!(db
+            .unresolved_hotkey_transcription_failures(10)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .latest_unresolved_hotkey_transcription_failure()
+            .unwrap()
+            .is_none());
+
+        let resolved = db
+            .get_hotkey_transcription_failure(failure.id)
+            .unwrap()
+            .unwrap();
+        assert!(resolved.resolved_at.is_some());
+    }
+
+    #[test]
+    fn expired_hotkey_transcription_failure_audio_is_selected_and_marked_cleaned() {
+        let db = temp_db();
+        let now = Utc::now();
+        let expired = db
+            .insert_hotkey_transcription_failure(
+                "20260811-090100.000000",
+                8,
+                &[],
+                None,
+                false,
+                "transcription failed",
+                Some("/tmp/expired-failure.mp3"),
+                Some("expired-failure.mp3"),
+                Some(now - Duration::minutes(1)),
+            )
+            .unwrap();
+        db.insert_hotkey_transcription_failure(
+            "20260811-090200.000000",
+            8,
+            &[],
+            None,
+            false,
+            "transcription failed",
+            Some("/tmp/fresh-failure.mp3"),
+            Some("fresh-failure.mp3"),
+            Some(now + Duration::hours(24)),
+        )
+        .unwrap();
+
+        let candidates = db
+            .expired_hotkey_transcription_failure_audio(now, 10)
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, expired.id);
+
+        db.mark_hotkey_transcription_failure_audio_cleaned(expired.id)
+            .unwrap();
+
+        assert!(db
+            .expired_hotkey_transcription_failure_audio(now, 10)
+            .unwrap()
+            .is_empty());
+        let cleaned = db
+            .get_hotkey_transcription_failure(expired.id)
+            .unwrap()
+            .unwrap();
+        assert!(cleaned.audio_cleaned_at.is_some());
     }
 }

@@ -207,8 +207,8 @@ button:disabled,select:disabled,input:disabled{opacity:.55;cursor:not-allowed}
             <div class="field-help">Successful hotkey recordings are kept for copy+ payloads.</div>
           </div>
           <div class="field">
-            <label for="hotkey-audio-retention-days">Retention days</label>
-            <input id="hotkey-audio-retention-days" type="number" min="0" max="3650" step="1">
+            <label for="hotkey-audio-retention-hours">Retention hours</label>
+            <input id="hotkey-audio-retention-hours" type="number" min="0" max="87600" step="1">
             <div class="field-help">0 expires immediately; cleanup runs in the background.</div>
           </div>
         </div>
@@ -348,7 +348,7 @@ function parseJsonOrThrow(response){
 }
 function settingsDefaults(){return (state.settings&&state.settings.defaults)||{}}
 function settingsPipelineDefaults(){return{filler_removal:state.settings?state.settings.filler_removal!==false:true,cleanup_engine:(state.settings&&state.settings.cleanup_engine)||'none'};}
-function settingsRetentionDefaults(){return{hotkey_audio_retention_enabled:state.settings?state.settings.hotkey_audio_retention_enabled!==false:true,hotkey_audio_retention_days:state.settings&&state.settings.hotkey_audio_retention_days!=null?state.settings.hotkey_audio_retention_days:7};}
+function settingsRetentionDefaults(){return{hotkey_audio_retention_enabled:state.settings?state.settings.hotkey_audio_retention_enabled!==false:true,hotkey_audio_retention_hours:state.settings&&state.settings.hotkey_audio_retention_hours!=null?state.settings.hotkey_audio_retention_hours:24};}
 function availabilityLabel(info){return info.available?'Ready':(info.reason||'Unavailable')}
 function isValidTab(tab){return TABS.indexOf(tab)>=0}
 function storedTab(){
@@ -515,8 +515,8 @@ function currentSettingsDraft(){
   var retention=settingsRetentionDefaults();
   var fillerCheck=$('filler-removal-check');
   var retentionCheck=$('hotkey-audio-retention-check');
-  var retentionDays=parseInt(($('hotkey-audio-retention-days')&&$('hotkey-audio-retention-days').value)||retention.hotkey_audio_retention_days,10);
-  if(isNaN(retentionDays))retentionDays=retention.hotkey_audio_retention_days;
+  var retentionHours=parseInt(($('hotkey-audio-retention-hours')&&$('hotkey-audio-retention-hours').value)||retention.hotkey_audio_retention_hours,10);
+  if(isNaN(retentionHours))retentionHours=retention.hotkey_audio_retention_hours;
   return {
     default_mode:$('default-mode-select').value||defaults.default_mode||'standard',
     default_standard_model:$('default-standard-model-select').value||defaults.default_standard_model||'large-v3-turbo',
@@ -524,7 +524,7 @@ function currentSettingsDraft(){
     filler_removal:fillerCheck?fillerCheck.checked:pipeline.filler_removal,
     cleanup_engine:($('cleanup-engine-select')&&$('cleanup-engine-select').value)||pipeline.cleanup_engine,
     hotkey_audio_retention_enabled:retentionCheck?retentionCheck.checked:retention.hotkey_audio_retention_enabled,
-    hotkey_audio_retention_days:retentionDays
+    hotkey_audio_retention_hours:retentionHours
   };
 }
 function renderSettingsModal(draft){
@@ -541,15 +541,15 @@ function renderSettingsModal(draft){
   if(engineSel)engineSel.value=draft.cleanup_engine||pipeline.cleanup_engine;
   var retentionCheck=$('hotkey-audio-retention-check');
   if(retentionCheck)retentionCheck.checked=draft.hasOwnProperty('hotkey_audio_retention_enabled')?draft.hotkey_audio_retention_enabled:retention.hotkey_audio_retention_enabled;
-  var retentionDays=$('hotkey-audio-retention-days');
-  if(retentionDays)retentionDays.value=draft.hotkey_audio_retention_days!=null?draft.hotkey_audio_retention_days:retention.hotkey_audio_retention_days;
+  var retentionHours=$('hotkey-audio-retention-hours');
+  if(retentionHours)retentionHours.value=draft.hotkey_audio_retention_hours!=null?draft.hotkey_audio_retention_hours:retention.hotkey_audio_retention_hours;
   renderRetentionControlState();
   renderModeStatus();
   renderStandardModelList();
 }
 function renderRetentionControlState(){
-  var check=$('hotkey-audio-retention-check'),days=$('hotkey-audio-retention-days');
-  if(check&&days)days.disabled=!check.checked;
+  var check=$('hotkey-audio-retention-check'),hours=$('hotkey-audio-retention-hours');
+  if(check&&hours)hours.disabled=!check.checked;
 }
 function renderDefaultModeSelect(current){
   var sel=$('default-mode-select');

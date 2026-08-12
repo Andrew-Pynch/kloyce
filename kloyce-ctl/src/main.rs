@@ -38,6 +38,16 @@ enum Commands {
     },
     /// Cancel current recording
     Cancel,
+    /// List persisted failed hotkey transcriptions (id, age, error, retained audio)
+    Failed,
+    /// Retry a failed hotkey transcription from its retained audio
+    Retry {
+        /// Failed transcription id to retry
+        id: Option<i64>,
+        /// Retry the most recently failed hotkey transcription
+        #[arg(long, conflicts_with = "id")]
+        last: bool,
+    },
     /// Transcribe an audio or video file
     TranscribeFile {
         /// Path to the source media file
@@ -203,6 +213,13 @@ const IPC_PORT: u16 = 19876;
 async fn main() {
     let cli = Cli::parse();
 
+    if let Commands::Retry { id, last } = &cli.command {
+        if id.is_none() && !*last {
+            eprintln!("kloyce-ctl retry requires an id or --last");
+            std::process::exit(1);
+        }
+    }
+
     if let Some(options) = file_job_options(&cli.command) {
         transcribe_file_job(options).await;
         return;
@@ -312,13 +329,18 @@ async fn main() {
     }
 }
 
-fn ipc_command_json(command: &Commands) -> Option<&'static str> {
+fn ipc_command_json(command: &Commands) -> Option<String> {
     match command {
-        Commands::Toggle => Some(r#"{"command":"toggle"}"#),
-        Commands::ToggleEnter => Some(r#"{"command":"toggle_enter"}"#),
-        Commands::CopyPlus => Some(r#"{"command":"copy_plus_latest"}"#),
-        Commands::Status { .. } => Some(r#"{"command":"status"}"#),
-        Commands::Cancel => Some(r#"{"command":"cancel"}"#),
+        Commands::Toggle => Some(r#"{"command":"toggle"}"#.to_string()),
+        Commands::ToggleEnter => Some(r#"{"command":"toggle_enter"}"#.to_string()),
+        Commands::CopyPlus => Some(r#"{"command":"copy_plus_latest"}"#.to_string()),
+        Commands::Status { .. } => Some(r#"{"command":"status"}"#.to_string()),
+        Commands::Cancel => Some(r#"{"command":"cancel"}"#.to_string()),
+        Commands::Failed => Some(r#"{"command":"list_failed_transcriptions"}"#.to_string()),
+        Commands::Retry { id, .. } => Some(match id {
+            Some(id) => format!(r#"{{"command":"retry_failed_transcription","id":{id}}}"#),
+            None => r#"{"command":"retry_failed_transcription","id":null}"#.to_string(),
+        }),
         _ => None,
     }
 }
@@ -672,7 +694,37 @@ mod tests {
     fn copy_plus_uses_copy_plus_latest_ipc_command() {
         assert_eq!(
             ipc_command_json(&Commands::CopyPlus),
-            Some(r#"{"command":"copy_plus_latest"}"#)
+            Some(r#"{"command":"copy_plus_latest"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn failed_uses_list_failed_transcriptions_ipc_command() {
+        assert_eq!(
+            ipc_command_json(&Commands::Failed),
+            Some(r#"{"command":"list_failed_transcriptions"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn retry_with_id_embeds_id_in_ipc_command() {
+        assert_eq!(
+            ipc_command_json(&Commands::Retry {
+                id: Some(42),
+                last: false,
+            }),
+            Some(r#"{"command":"retry_failed_transcription","id":42}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn retry_last_omits_id_in_ipc_command() {
+        assert_eq!(
+            ipc_command_json(&Commands::Retry {
+                id: None,
+                last: true,
+            }),
+            Some(r#"{"command":"retry_failed_transcription","id":null}"#.to_string())
         );
     }
 

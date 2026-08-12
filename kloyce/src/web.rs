@@ -234,7 +234,7 @@ struct TranscriptionSettingsResponse {
     filler_removal: bool,
     cleanup_engine: crate::config::CleanupEngine,
     hotkey_audio_retention_enabled: bool,
-    hotkey_audio_retention_days: i64,
+    hotkey_audio_retention_hours: u64,
 }
 
 /// Extended settings update — superset of `TranscriptionDefaultsUpdate` that also
@@ -246,7 +246,7 @@ struct TranscriptionSettingsUpdate {
     filler_removal: Option<bool>,
     cleanup_engine: Option<crate::config::CleanupEngine>,
     hotkey_audio_retention_enabled: Option<bool>,
-    hotkey_audio_retention_days: Option<i64>,
+    hotkey_audio_retention_hours: Option<u64>,
 }
 
 async fn api_transcription_settings(AxumState(state): AxumState<WebState>) -> impl IntoResponse {
@@ -257,7 +257,7 @@ async fn api_transcription_settings(AxumState(state): AxumState<WebState>) -> im
         filler_removal: config.filler_removal,
         cleanup_engine: config.cleanup_engine,
         hotkey_audio_retention_enabled: config.hotkey_audio_retention_enabled,
-        hotkey_audio_retention_days: config.hotkey_audio_retention_days,
+        hotkey_audio_retention_hours: config.hotkey_audio_retention_hours,
     })
 }
 
@@ -290,7 +290,7 @@ async fn api_update_transcription_settings(
     }
     if let Err(error) = next.apply_hotkey_audio_retention_update(
         update.hotkey_audio_retention_enabled,
-        update.hotkey_audio_retention_days,
+        update.hotkey_audio_retention_hours,
     ) {
         return (
             StatusCode::BAD_REQUEST,
@@ -325,7 +325,7 @@ async fn api_update_transcription_settings(
             "filler_removal": next.filler_removal,
             "cleanup_engine": next.cleanup_engine,
             "hotkey_audio_retention_enabled": next.hotkey_audio_retention_enabled,
-            "hotkey_audio_retention_days": next.hotkey_audio_retention_days,
+            "hotkey_audio_retention_hours": next.hotkey_audio_retention_hours,
         })),
     )
 }
@@ -1298,7 +1298,7 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("default-standard-model-select"));
         assert!(DASHBOARD_HTML.contains("default-diarized-model"));
         assert!(DASHBOARD_HTML.contains("hotkey-audio-retention-check"));
-        assert!(DASHBOARD_HTML.contains("hotkey-audio-retention-days"));
+        assert!(DASHBOARD_HTML.contains("hotkey-audio-retention-hours"));
         assert!(DASHBOARD_HTML.contains("/api/transcription/settings"));
         assert!(DASHBOARD_HTML.contains("/api/models/standard"));
         assert!(DASHBOARD_HTML.contains("/api/models/standard/{model_id}/download"));

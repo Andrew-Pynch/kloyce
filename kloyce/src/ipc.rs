@@ -10,6 +10,8 @@ pub enum Command {
     CopyPlusLatest,
     Status,
     Cancel,
+    ListFailedTranscriptions,
+    RetryFailedTranscription { id: Option<i64> },
 }
 
 #[derive(Debug, Serialize, Clone)]

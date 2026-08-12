@@ -137,6 +137,48 @@ impl MediaStorage {
         Ok(working_audio)
     }
 
+    /// Convert a retained hotkey recording (MP3 or WAV) into a normalized 16kHz
+    /// mono WAV that `transcribe::transcribe` can consume, used when retrying a
+    /// failed hotkey transcription. Keyed by `failure-<id>` so it never collides
+    /// with a real transcription job's working directory.
+    pub async fn prepare_hotkey_retry_working_audio(
+        &self,
+        failure_id: i64,
+        source_path: &Path,
+    ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_audio_stream(source_path).await?;
+
+        let retry_working_dir = self.working_root.join(format!("hotkey-retry-{failure_id}"));
+        tokio::fs::create_dir_all(&retry_working_dir).await?;
+        let working_audio = retry_working_dir.join(WORKING_AUDIO_FILENAME);
+        let output = Command::new(&self.ffmpeg_bin)
+            .arg("-y")
+            .arg("-i")
+            .arg(source_path)
+            .arg("-vn")
+            .arg("-ac")
+            .arg("1")
+            .arg("-ar")
+            .arg("16000")
+            .arg("-c:a")
+            .arg("pcm_s16le")
+            .arg(&working_audio)
+            .output()
+            .await
+            .map_err(|error| format!("Failed to run ffmpeg: {error}"))?;
+
+        if !output.status.success() {
+            delete_file_and_parent_dir(&working_audio).await;
+            return Err(format!(
+                "ffmpeg failed while preparing hotkey retry working audio: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+            .into());
+        }
+
+        Ok(working_audio)
+    }
+
     pub async fn store_hotkey_recording(
         &self,
         recording_id: &str,

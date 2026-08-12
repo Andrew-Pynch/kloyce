@@ -52,12 +52,20 @@ impl ContextCollector {
     }
 }
 
+/// Window classes recognized as terminal emulators for tmux target capture.
+fn is_terminal_class(class: &str) -> bool {
+    matches!(
+        class.to_ascii_lowercase().as_str(),
+        "alacritty" | "kitty" | "com.mitchellh.ghostty" | "org.wezfurlong.wezterm" | "foot"
+    )
+}
+
 /// Capture the tmux target (session:window.pane) of the currently-focused terminal.
 /// Returns None if the focused window is not a terminal, or not running tmux.
 pub async fn capture_tmux_target() -> Option<String> {
     let (class, alacritty_pid) = get_active_window().await?;
 
-    if !class.eq_ignore_ascii_case("alacritty") {
+    if !is_terminal_class(&class) {
         return None;
     }
 
@@ -116,7 +124,7 @@ async fn get_tmux_pane_target(session_name: &str) -> Option<String> {
 async fn poll_active_window() -> Option<String> {
     let (class, pid) = get_active_window().await?;
 
-    if class.eq_ignore_ascii_case("alacritty") {
+    if is_terminal_class(&class) {
         match resolve_alacritty_context(pid).await {
             Some(tag) => Some(tag),
             None => Some("terminal".into()),

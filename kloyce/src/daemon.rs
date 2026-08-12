@@ -21,6 +21,7 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 
 const MEDIA_CLEANUP_BATCH_SIZE: usize = 100;
 const MEDIA_CLEANUP_INTERVAL_SECS: u64 = 60 * 60;
+const HOTKEY_FAILURE_RETRY_DELAY_SECS: u64 = 30;
 
 type RecordingHandle = (Child, PathBuf, String, DateTime<Utc>);
 
@@ -92,9 +93,7 @@ mod tests {
                 text: "presentation draft pass".to_string(),
                 context_tags: vec!["deck".to_string(), "practice".to_string()],
                 recording_id: Some("20260630-120000.000000".to_string()),
-                audio_path: Some(
-                    "/tmp/kloyce-test/media/recordings/pass.mp3".to_string(),
-                ),
+                audio_path: Some("/tmp/kloyce-test/media/recordings/pass.mp3".to_string()),
                 audio_filename: Some("pass.mp3".to_string()),
                 audio_expires_at: Some(expires),
                 audio_cleaned_at: None,
@@ -104,8 +103,7 @@ mod tests {
 
         assert!(payload.starts_with("```{kloyce-20260630-120000.000000.txt}\n"));
         assert!(payload.contains("presentation draft pass\n```\n\n"));
-        assert!(payload
-            .contains("audio_path: /tmp/kloyce-test/media/recordings/pass.mp3"));
+        assert!(payload.contains("audio_path: /tmp/kloyce-test/media/recordings/pass.mp3"));
         assert!(payload.contains("audio_expires_at: 2026-07-07T17:00:00+00:00"));
         assert!(payload.contains("recorded_at: 2026-06-30T17:00:00+00:00"));
         assert!(payload.contains("duration_secs: 42"));
@@ -193,6 +191,49 @@ mod tests {
         let payload = format_tmux_transcript_payload("fix the bug", true, "   ");
 
         assert_eq!(payload, Some("fix the bug".to_string()));
+    }
+
+    #[test]
+    fn clipboard_transcript_payload_prefixes_tag_with_newline() {
+        let payload = format_clipboard_transcript_payload(
+            "  fix the bug in the parser  ",
+            true,
+            "[voice transcript - if anything is unclear, ask for clarification]",
+        );
+
+        assert_eq!(
+            payload,
+            "[voice transcript - if anything is unclear, ask for clarification]\nfix the bug in the parser"
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn clipboard_transcript_payload_omits_tag_when_disabled() {
+        let payload = format_clipboard_transcript_payload(
+            "fix the bug in the parser",
+            false,
+            "[voice transcript]",
+        );
+
+        assert_eq!(payload, "fix the bug in the parser".to_string());
+    }
+
+    #[test]
+    fn clipboard_transcript_payload_falls_back_to_plain_text_when_tag_text_blank() {
+        let payload = format_clipboard_transcript_payload("fix the bug", true, "   ");
+
+        assert_eq!(payload, "fix the bug".to_string());
+    }
+
+    #[test]
+    fn clipboard_transcript_payload_returns_raw_text_for_blank_transcript() {
+        // Unlike the tmux payload, clipboard formatting never suppresses a
+        // blank transcript — the caller always copies *something* to the
+        // clipboard, it just isn't tag-prefixed when there's no content.
+        let payload = format_clipboard_transcript_payload("   \n\t  ", true, "[voice transcript]");
+
+        assert_eq!(payload, "   \n\t  ".to_string());
     }
 
     #[tokio::test]
@@ -291,6 +332,45 @@ mod tests {
             .unwrap()
             .is_empty());
     }
+
+    #[tokio::test]
+    async fn terminal_media_cleanup_deletes_expired_failed_hotkey_audio() {
+        let dir = temp_dir("failed-hotkey-audio-cleanup");
+        let db = temp_db(&dir);
+        let audio_path = dir.join("media/recordings/kloyce-failed-test.mp3");
+        let audio_path_str = audio_path.to_string_lossy().to_string();
+        std::fs::create_dir_all(audio_path.parent().unwrap()).unwrap();
+        std::fs::write(&audio_path, b"audio").unwrap();
+        let failure = db
+            .insert_hotkey_transcription_failure(
+                "20260811-120000.000000",
+                10,
+                &[],
+                None,
+                false,
+                "whisper-cli exited with status 1",
+                Some(audio_path_str.as_str()),
+                Some("kloyce-failed-test.mp3"),
+                Some(Utc::now() - Duration::minutes(1)),
+            )
+            .unwrap();
+
+        let storage = MediaStorage::new(dir, PathBuf::from("ffmpeg"), PathBuf::from("ffprobe"));
+        cleanup_terminal_job_media(&db, &storage, Utc::now())
+            .await
+            .unwrap();
+
+        assert!(!audio_path.exists());
+        let updated = db
+            .get_hotkey_transcription_failure(failure.id)
+            .unwrap()
+            .unwrap();
+        assert!(updated.audio_cleaned_at.is_some());
+        assert!(db
+            .expired_hotkey_transcription_failure_audio(Utc::now(), 10)
+            .unwrap()
+            .is_empty());
+    }
 }
 
 async fn run_transcription_job_worker(
@@ -358,6 +438,7 @@ async fn cleanup_terminal_job_media(
     cleanup_terminal_working_audio(database, media_storage).await?;
     cleanup_expired_source_media(database, media_storage, now).await?;
     cleanup_expired_transcription_audio(database, media_storage, now).await?;
+    cleanup_expired_hotkey_failure_audio(database, media_storage, now).await?;
     Ok(())
 }
 
@@ -451,6 +532,38 @@ async fn cleanup_expired_transcription_audio(
     Ok(())
 }
 
+async fn cleanup_expired_hotkey_failure_audio(
+    database: &db::Db,
+    media_storage: &MediaStorage,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let audio_entries = database
+        .expired_hotkey_transcription_failure_audio(now, MEDIA_CLEANUP_BATCH_SIZE)
+        .map_err(|error| format!("failed to load expired failed-hotkey audio entries: {error}"))?;
+
+    for audio_entry in audio_entries {
+        media_storage
+            .delete_retained_audio_path(Path::new(&audio_entry.audio_path))
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to delete retained failed-hotkey audio for failure {}: {error}",
+                    audio_entry.id
+                )
+            })?;
+        database
+            .mark_hotkey_transcription_failure_audio_cleaned(audio_entry.id)
+            .map_err(|error| {
+                format!(
+                    "failed to mark failed-hotkey audio cleaned for failure {}: {error}",
+                    audio_entry.id
+                )
+            })?;
+    }
+
+    Ok(())
+}
+
 async fn retain_hotkey_recording_audio(
     config: &Config,
     data_dir: &Path,
@@ -467,7 +580,7 @@ async fn retain_hotkey_recording_audio(
         config.ffmpeg_bin.clone(),
         config.ffprobe_bin.clone(),
     );
-    let expires_at = record_stop_time + Duration::days(config.hotkey_audio_retention_days.max(0));
+    let expires_at = record_stop_time + Duration::hours(config.hotkey_audio_retention_hours as i64);
 
     match media_storage
         .store_hotkey_recording(recording_id, wav_path)
@@ -535,10 +648,15 @@ fn format_copy_plus_payload(entry: &TranscriptionEntry, voice_tag_text: &str) ->
     payload
 }
 
-fn format_tmux_transcript_payload(
+/// Prefix `text` with `voice_tag_text` (joined by `separator`) when
+/// `include_voice_tag` is true and the tag text is non-blank. Shared by the
+/// tmux send-keys path (space-joined, single line) and the clipboard path
+/// (newline-joined). Returns `None` for a blank transcript.
+fn format_voice_tagged_text(
     text: &str,
     include_voice_tag: bool,
     voice_tag_text: &str,
+    separator: &str,
 ) -> Option<String> {
     let text = text.trim();
     if text.is_empty() {
@@ -550,11 +668,31 @@ fn format_tmux_transcript_payload(
         if voice_tag_text.is_empty() {
             Some(text.to_string())
         } else {
-            Some(format!("{voice_tag_text} {text}"))
+            Some(format!("{voice_tag_text}{separator}{text}"))
         }
     } else {
         Some(text.to_string())
     }
+}
+
+fn format_tmux_transcript_payload(
+    text: &str,
+    include_voice_tag: bool,
+    voice_tag_text: &str,
+) -> Option<String> {
+    format_voice_tagged_text(text, include_voice_tag, voice_tag_text, " ")
+}
+
+/// Format the transcript for clipboard output. Unlike the tmux payload, a
+/// blank transcript is not suppressed here — the caller always has *some*
+/// text to copy (possibly empty), it just isn't tag-prefixed.
+fn format_clipboard_transcript_payload(
+    text: &str,
+    include_voice_tag: bool,
+    voice_tag_text: &str,
+) -> String {
+    format_voice_tagged_text(text, include_voice_tag, voice_tag_text, "\n")
+        .unwrap_or_else(|| text.to_string())
 }
 
 fn transcript_filename_for_copy_plus(entry: &TranscriptionEntry) -> String {
@@ -1175,6 +1313,353 @@ fn short_job_error(error_message: &str) -> String {
     shortened
 }
 
+/// Kick off a background task that waits `HOTKEY_FAILURE_RETRY_DELAY_SECS`
+/// and then retries a failed hotkey transcription from its retained audio.
+#[allow(clippy::too_many_arguments)]
+fn schedule_hotkey_transcription_retry(
+    failure_id: i64,
+    config: Arc<RwLock<Config>>,
+    database: Arc<db::Db>,
+    dictionary: Arc<RwLock<Dictionary>>,
+    event_tx: broadcast::Sender<web::SseEvent>,
+    metrics: Arc<RwLock<Metrics>>,
+    history: Arc<Mutex<VecDeque<TranscriptionEntry>>>,
+    history_size: usize,
+    data_dir: PathBuf,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            HOTKEY_FAILURE_RETRY_DELAY_SECS,
+        ))
+        .await;
+        retry_hotkey_transcription(
+            failure_id,
+            config,
+            database,
+            dictionary,
+            event_tx,
+            metrics,
+            history,
+            history_size,
+            data_dir,
+        )
+        .await;
+    });
+}
+
+/// Reprocess a failed hotkey transcription from its retained audio through
+/// the same transcribe + pipeline + output path used for a live recording.
+/// Used both by the automatic 30s retry and by `kloyce-ctl retry`.
+#[allow(clippy::too_many_arguments)]
+async fn retry_hotkey_transcription(
+    failure_id: i64,
+    config: Arc<RwLock<Config>>,
+    database: Arc<db::Db>,
+    dictionary: Arc<RwLock<Dictionary>>,
+    event_tx: broadcast::Sender<web::SseEvent>,
+    metrics: Arc<RwLock<Metrics>>,
+    history: Arc<Mutex<VecDeque<TranscriptionEntry>>>,
+    history_size: usize,
+    data_dir: PathBuf,
+) {
+    let db_handle = database.clone();
+    let failure = match tokio::task::spawn_blocking(move || {
+        db_handle.get_hotkey_transcription_failure(failure_id)
+    })
+    .await
+    {
+        Ok(Ok(Some(failure))) => failure,
+        Ok(Ok(None)) => {
+            tracing::warn!(
+                failure_id,
+                "Failed hotkey transcription no longer exists; skipping retry"
+            );
+            return;
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                failure_id,
+                "Failed to load failed hotkey transcription for retry: {error}"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::error!(failure_id, "Retry lookup task crashed: {error}");
+            return;
+        }
+    };
+
+    if failure.resolved_at.is_some() {
+        tracing::info!(
+            failure_id,
+            "Failed hotkey transcription already resolved; skipping retry"
+        );
+        return;
+    }
+
+    let Some(audio_path) = failure.audio_path.clone() else {
+        tracing::warn!(
+            failure_id,
+            "No retained audio for failed hotkey transcription; skipping retry"
+        );
+        return;
+    };
+    let audio_path = PathBuf::from(audio_path);
+    if !audio_path.exists() {
+        tracing::warn!(
+            failure_id,
+            audio_path = %audio_path.display(),
+            "Retained audio missing; skipping retry"
+        );
+        return;
+    }
+
+    tracing::info!(
+        failure_id,
+        recording_id = %failure.recording_id,
+        audio_path = %audio_path.display(),
+        "Retrying hotkey transcription from retained audio"
+    );
+
+    let config_snapshot = config.read().await.clone();
+    let whisper_prompt = dictionary.read().await.whisper_prompt();
+
+    let media_storage = MediaStorage::new(
+        data_dir,
+        config_snapshot.ffmpeg_bin.clone(),
+        config_snapshot.ffprobe_bin.clone(),
+    );
+    let working_audio = match media_storage
+        .prepare_hotkey_retry_working_audio(failure_id, &audio_path)
+        .await
+    {
+        Ok(path) => path,
+        Err(error) => {
+            let error_text = error.to_string();
+            tracing::error!(
+                failure_id,
+                "Failed to prepare retry working audio: {error_text}"
+            );
+            let db_handle = database.clone();
+            let error_for_db = error_text.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                db_handle.record_hotkey_transcription_failure_retry_error(failure_id, &error_for_db)
+            })
+            .await;
+            output::notify_progress(
+                "Kloyce Error",
+                &format!(
+                    "Retry failed: {}. Run `kloyce-ctl retry {failure_id}` to try again.",
+                    short_job_error(&error_text)
+                ),
+                None,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let result = transcribe::transcribe(
+        &working_audio,
+        &config_snapshot.model_path,
+        &config_snapshot.whisper_bin,
+        event_tx.clone(),
+        whisper_prompt.as_deref(),
+        config_snapshot.whisper_flash_attn,
+        config_snapshot.whisper_threads,
+        config_snapshot.whisper_beam_size,
+    )
+    .await;
+    media_storage
+        .delete_working_audio_path(&working_audio)
+        .await;
+
+    match result {
+        Ok(raw_text) => {
+            let pipeline = TranscriptPipeline::new(dictionary.clone());
+            let pipeline_policy = TranscriptPipelinePolicy::from_config(&config_snapshot);
+            let processed = pipeline
+                .process(&raw_text, &failure.context_tags, &pipeline_policy)
+                .await;
+            let word_count = processed.word_count;
+            let text = processed.text;
+
+            {
+                let mut m = metrics.write().await;
+                m.total_transcriptions += 1;
+                m.total_words += word_count;
+            }
+
+            let entry = TranscriptionEntry {
+                timestamp: Utc::now(),
+                duration_secs: failure.duration_secs,
+                word_count,
+                text: text.clone(),
+                context_tags: failure.context_tags.clone(),
+                recording_id: Some(failure.recording_id.clone()),
+                audio_path: Some(audio_path.to_string_lossy().to_string()),
+                audio_filename: failure.audio_filename.clone(),
+                audio_expires_at: failure.audio_expires_at,
+                audio_cleaned_at: None,
+            };
+            {
+                let mut h = history.lock().await;
+                h.push_front(entry.clone());
+                while h.len() > history_size {
+                    h.pop_back();
+                }
+            }
+
+            let db_handle = database.clone();
+            let entry_for_db = entry.clone();
+            match tokio::task::spawn_blocking(move || db_handle.insert(&entry_for_db)).await {
+                Ok(Ok(())) => {
+                    tracing::info!(failure_id, "Persisted retried transcription");
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(
+                        failure_id,
+                        "Failed to persist retried transcription: {error}"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        failure_id,
+                        "Persistence task for retried transcription failed: {error}"
+                    );
+                }
+            }
+
+            let _ = event_tx.send(web::SseEvent::Transcription(entry));
+
+            let clipboard_text = format_clipboard_transcript_payload(
+                &text,
+                config_snapshot.clipboard_voice_tag,
+                &config_snapshot.tmux_voice_tag_text,
+            );
+            let mut output_methods = Vec::new();
+            let mut output_errors = Vec::new();
+            match output::set_clipboard(&clipboard_text).await {
+                Ok(()) => output_methods.push("copied to clipboard"),
+                Err(e) => output_errors.push(format!("clipboard: {e}")),
+            }
+
+            if let Some((target, tmux_text)) =
+                failure
+                    .tmux_target
+                    .as_ref()
+                    .zip(format_tmux_transcript_payload(
+                        &text,
+                        config_snapshot.tmux_voice_tag,
+                        &config_snapshot.tmux_voice_tag_text,
+                    ))
+            {
+                match output::tmux_send_keys(&tmux_text, target).await {
+                    Ok(()) => {
+                        output_methods.push("sent to tmux pane");
+                        if failure.auto_enter {
+                            if let Err(e) = output::tmux_send_enter(target).await {
+                                output_errors.push(format!("tmux enter: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => output_errors.push(format!("tmux: {e}")),
+                }
+            }
+
+            let db_resolve = database.clone();
+            match tokio::task::spawn_blocking(move || {
+                db_resolve.mark_hotkey_transcription_failure_resolved(failure_id)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::error!(
+                        failure_id,
+                        "Failed to mark failed hotkey transcription resolved: {error}"
+                    )
+                }
+                Err(error) => {
+                    tracing::error!(
+                        failure_id,
+                        "Resolve task for hotkey failure crashed: {error}"
+                    )
+                }
+            }
+
+            if output_methods.is_empty() {
+                output::notify_progress(
+                    "Kloyce",
+                    &format!(
+                        "Retry succeeded but delivery failed: {}",
+                        output_errors.join("; ")
+                    ),
+                    Some(100),
+                )
+                .await;
+            } else {
+                output::notify_progress(
+                    "Kloyce",
+                    &format!(
+                        "Retry succeeded: {word_count} words {}",
+                        output_methods.join(" and ")
+                    ),
+                    Some(100),
+                )
+                .await;
+            }
+        }
+        Err(error) => {
+            let error_text = error.to_string();
+            tracing::error!(
+                failure_id,
+                "Hotkey transcription retry failed: {error_text}"
+            );
+            let db_handle = database.clone();
+            let error_for_db = error_text.clone();
+            match tokio::task::spawn_blocking(move || {
+                db_handle.record_hotkey_transcription_failure_retry_error(failure_id, &error_for_db)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(db_error)) => {
+                    tracing::error!(failure_id, "Failed to record retry failure: {db_error}")
+                }
+                Err(join_error) => {
+                    tracing::error!(
+                        failure_id,
+                        "Retry-failure recording task crashed: {join_error}"
+                    )
+                }
+            }
+            output::notify_progress(
+                "Kloyce Error",
+                &format!(
+                    "Retry failed: {}. Run `kloyce-ctl retry {failure_id}` to try again.",
+                    short_job_error(&error_text)
+                ),
+                None,
+            )
+            .await;
+        }
+    }
+}
+
+fn format_failed_transcription_age(duration: Duration) -> String {
+    let total_secs = duration.num_seconds().max(0);
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    if hours > 0 {
+        format!("{hours}h{minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{total_secs}s")
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Metrics {
     pub total_transcriptions: u64,
@@ -1352,6 +1837,8 @@ impl Daemon {
                     }
                 }
                 Command::Cancel => self.handle_cancel().await,
+                Command::ListFailedTranscriptions => self.handle_list_failed().await,
+                Command::RetryFailedTranscription { id } => self.handle_retry_failed(id).await,
             };
             let _ = resp_tx.send(response);
         }
@@ -1559,6 +2046,7 @@ impl Daemon {
                     }
 
                     // Transcribe in background
+                    let config_arc = self.config.clone();
                     let config = config.clone();
                     let state = self.state.clone();
                     let metrics = self.metrics.clone();
@@ -1721,7 +2209,12 @@ impl Daemon {
                                 let _ = event_tx.send(web::SseEvent::Transcription(entry));
 
                                 let clipboard_start = std::time::Instant::now();
-                                let clipboard_result = output::set_clipboard(&text).await;
+                                let clipboard_text = format_clipboard_transcript_payload(
+                                    &text,
+                                    config.clipboard_voice_tag,
+                                    &config.tmux_voice_tag_text,
+                                );
+                                let clipboard_result = output::set_clipboard(&clipboard_text).await;
                                 let clipboard_ms = clipboard_start.elapsed().as_millis();
                                 let mut output_methods = Vec::new();
                                 let mut output_errors = Vec::new();
@@ -1731,7 +2224,7 @@ impl Daemon {
                                         tracing::info!(
                                             recording_id = %recording_id,
                                             clipboard_ms,
-                                            clipboard_bytes = text.len(),
+                                            clipboard_bytes = clipboard_text.len(),
                                             "Copied transcription to clipboard"
                                         );
                                         output_methods.push("copied to clipboard");
@@ -1857,17 +2350,130 @@ impl Daemon {
                                 }
                             }
                             Err(e) => {
+                                let error_text = e.to_string();
                                 tracing::error!(
                                     recording_id = %recording_id,
                                     transcription_ms = transcription_start.elapsed().as_millis(),
-                                    "Transcription failed: {e}"
+                                    "Transcription failed: {error_text}"
                                 );
-                                output::notify_progress(
-                                    "Kloyce Error",
-                                    &format!("Transcription failed: {e}"),
-                                    None,
+
+                                let retained_audio = retain_hotkey_recording_audio(
+                                    &config,
+                                    &data_dir,
+                                    &recording_id,
+                                    &wav_path,
+                                    record_stop_time,
                                 )
                                 .await;
+                                let has_audio = retained_audio.is_some();
+
+                                let db_handle = database.clone();
+                                let recording_id_for_db = recording_id.clone();
+                                let context_tags_for_db = context_tags.clone();
+                                let tmux_target_for_db = tmux_target.clone();
+                                let error_text_for_db = error_text.clone();
+                                let audio_path_for_db = retained_audio
+                                    .as_ref()
+                                    .map(|metadata| metadata.path.clone());
+                                let audio_filename_for_db = retained_audio
+                                    .as_ref()
+                                    .map(|metadata| metadata.filename.clone());
+                                let audio_expires_at_for_db =
+                                    retained_audio.as_ref().map(|metadata| metadata.expires_at);
+                                let failure_record = tokio::task::spawn_blocking(move || {
+                                    db_handle.insert_hotkey_transcription_failure(
+                                        &recording_id_for_db,
+                                        recording_duration_secs,
+                                        &context_tags_for_db,
+                                        tmux_target_for_db.as_deref(),
+                                        auto_enter,
+                                        &error_text_for_db,
+                                        audio_path_for_db.as_deref(),
+                                        audio_filename_for_db.as_deref(),
+                                        audio_expires_at_for_db,
+                                    )
+                                })
+                                .await;
+
+                                match failure_record {
+                                    Ok(Ok(failure)) => {
+                                        tracing::info!(
+                                            recording_id = %recording_id,
+                                            failure_id = failure.id,
+                                            audio_retained = has_audio,
+                                            "Persisted failed hotkey transcription"
+                                        );
+
+                                        if has_audio {
+                                            schedule_hotkey_transcription_retry(
+                                                failure.id,
+                                                config_arc.clone(),
+                                                database.clone(),
+                                                dictionary.clone(),
+                                                event_tx.clone(),
+                                                metrics.clone(),
+                                                history.clone(),
+                                                history_size,
+                                                data_dir.clone(),
+                                            );
+                                            output::notify_progress(
+                                                "Kloyce Error",
+                                                &format!(
+                                                    "Transcription failed: {}. Audio retained, retrying in {}s.",
+                                                    short_job_error(&error_text),
+                                                    HOTKEY_FAILURE_RETRY_DELAY_SECS,
+                                                ),
+                                                None,
+                                            )
+                                            .await;
+                                        } else {
+                                            tracing::warn!(
+                                                failure_id = failure.id,
+                                                "No retained audio for failed hotkey transcription; skipping automatic retry"
+                                            );
+                                            output::notify_progress(
+                                                "Kloyce Error",
+                                                &format!(
+                                                    "Transcription failed: {}. Audio was not retained; see `kloyce-ctl failed`.",
+                                                    short_job_error(&error_text)
+                                                ),
+                                                None,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    Ok(Err(db_error)) => {
+                                        tracing::error!(
+                                            recording_id = %recording_id,
+                                            "Failed to persist failed hotkey transcription: {db_error}"
+                                        );
+                                        output::notify_progress(
+                                            "Kloyce Error",
+                                            &format!(
+                                                "Transcription failed: {}",
+                                                short_job_error(&error_text)
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                    Err(join_error) => {
+                                        tracing::error!(
+                                            recording_id = %recording_id,
+                                            "Persistence task for failed hotkey transcription crashed: {join_error}"
+                                        );
+                                        output::notify_progress(
+                                            "Kloyce Error",
+                                            &format!(
+                                                "Transcription failed: {}",
+                                                short_job_error(&error_text)
+                                            ),
+                                            None,
+                                        )
+                                        .await;
+                                    }
+                                }
+
                                 audio::play_sound(&config.sound_stop);
                             }
                         }
@@ -1899,6 +2505,154 @@ impl Daemon {
                 state: "transcribing".into(),
                 message: "Transcription in progress, please wait".into(),
             },
+        }
+    }
+
+    async fn handle_list_failed(&self) -> Response {
+        let current_state = self.state.read().await.to_string();
+        let database = self.database.clone();
+        let failures = tokio::task::spawn_blocking(move || {
+            database.unresolved_hotkey_transcription_failures(50)
+        })
+        .await;
+
+        let failures = match failures {
+            Ok(Ok(failures)) => failures,
+            Ok(Err(error)) => {
+                return Response {
+                    status: "error",
+                    state: current_state,
+                    message: format!("Failed to load failed transcriptions: {error}"),
+                };
+            }
+            Err(error) => {
+                return Response {
+                    status: "error",
+                    state: current_state,
+                    message: format!("Failed transcriptions lookup task failed: {error}"),
+                };
+            }
+        };
+
+        if failures.is_empty() {
+            return Response {
+                status: "ok",
+                state: current_state,
+                message: "No failed hotkey transcriptions".into(),
+            };
+        }
+
+        let now = Utc::now();
+        let lines: Vec<String> = failures
+            .iter()
+            .map(|failure| {
+                format!(
+                    "id={} age={} retries={} audio={} error={}",
+                    failure.id,
+                    format_failed_transcription_age(now - failure.created_at),
+                    failure.retry_count,
+                    if failure.audio_path.is_some() {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                    short_job_error(&failure.error_message),
+                )
+            })
+            .collect();
+
+        Response {
+            status: "ok",
+            state: current_state,
+            message: lines.join("\n"),
+        }
+    }
+
+    async fn handle_retry_failed(&self, id: Option<i64>) -> Response {
+        let current_state = self.state.read().await.to_string();
+        let database = self.database.clone();
+        let lookup = match id {
+            Some(id) => {
+                let db_handle = database.clone();
+                tokio::task::spawn_blocking(move || db_handle.get_hotkey_transcription_failure(id))
+                    .await
+            }
+            None => {
+                let db_handle = database.clone();
+                tokio::task::spawn_blocking(move || {
+                    db_handle.latest_unresolved_hotkey_transcription_failure()
+                })
+                .await
+            }
+        };
+
+        let failure = match lookup {
+            Ok(Ok(Some(failure))) => failure,
+            Ok(Ok(None)) => {
+                return Response {
+                    status: "error",
+                    state: current_state,
+                    message: match id {
+                        Some(id) => format!("No failed hotkey transcription found with id {id}"),
+                        None => "No unresolved failed hotkey transcriptions found".into(),
+                    },
+                };
+            }
+            Ok(Err(error)) => {
+                return Response {
+                    status: "error",
+                    state: current_state,
+                    message: format!("Failed to load failed transcription: {error}"),
+                };
+            }
+            Err(error) => {
+                return Response {
+                    status: "error",
+                    state: current_state,
+                    message: format!("Retry lookup task failed: {error}"),
+                };
+            }
+        };
+
+        if failure.resolved_at.is_some() {
+            return Response {
+                status: "error",
+                state: current_state,
+                message: format!(
+                    "Failed hotkey transcription {} is already resolved",
+                    failure.id
+                ),
+            };
+        }
+        if failure.audio_path.is_none() {
+            return Response {
+                status: "error",
+                state: current_state,
+                message: format!(
+                    "Failed hotkey transcription {} has no retained audio to retry",
+                    failure.id
+                ),
+            };
+        }
+
+        let failure_id = failure.id;
+        let history_size = self.config.read().await.history_size;
+        tokio::spawn(retry_hotkey_transcription(
+            failure_id,
+            self.config.clone(),
+            self.database.clone(),
+            self.dictionary.clone(),
+            self.event_tx.clone(),
+            self.metrics.clone(),
+            self.history.clone(),
+            history_size,
+            self.data_dir.clone(),
+        ));
+
+        Response {
+            status: "ok",
+            state: current_state,
+            message: format!("Retrying failed hotkey transcription {failure_id}"),
         }
     }
 
